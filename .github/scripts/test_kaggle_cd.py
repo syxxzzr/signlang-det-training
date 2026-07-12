@@ -72,6 +72,16 @@ class KaggleMetadataTests(unittest.TestCase):
         error.response = response
         self.assertTrue(kaggle_cd.KaggleClient._kernel_missing(error))
 
+    def test_treats_wrapped_kernels_get_denial_as_a_missing_kernel(self):
+        error = ValueError(
+            "Cannot access kernel 'alice/signlang-det-training' "
+            "(Permission 'kernels.get' was denied)."
+        )
+        self.assertTrue(kaggle_cd.KaggleClient._kernel_missing(error))
+
+    def test_does_not_hide_unrelated_value_errors(self):
+        self.assertFalse(kaggle_cd.KaggleClient._kernel_missing(ValueError("invalid metadata")))
+
     def test_does_not_hide_unrelated_api_failures(self):
         response = type("Response", (), {"status_code": 429})()
         error = type("HTTPError", (Exception,), {})("rate limited")

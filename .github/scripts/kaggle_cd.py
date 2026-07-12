@@ -282,9 +282,14 @@ class KaggleClient:
             or getattr(response, "status_code", None)
         )
         # GetKernel hides a nonexistent kernel behind 403 for some access-token
-        # requests. The owner is always the authenticated token user, so this
-        # cannot mask an attempt to read another account's private kernel.
-        return status in {403, 404}
+        # requests, and newer clients wrap that response in a ValueError without
+        # retaining the status. The owner is always the authenticated token user,
+        # so this cannot mask an attempt to read another account's private kernel.
+        permission_denied = (
+            isinstance(exc, ValueError)
+            and "Permission 'kernels.get' was denied" in str(exc)
+        )
+        return status in {403, 404} or permission_denied
 
     def latest(self) -> Optional[dict[str, Any]]:
         from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
