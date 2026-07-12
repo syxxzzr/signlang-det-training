@@ -1,0 +1,70 @@
+name: Kaggle CD - scheduled worker
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      force_poll:
+        description: Ignore the configured poll interval for this tick
+        required: false
+        default: false
+        type: boolean
+      retry_tag:
+        description: Requeue one failed tag before running this tick
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kaggle-cd-worker
+  cancel-in-progress: false
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KAGGLE_KERNEL_SLUG: ${{ vars.KAGGLE_KERNEL_SLUG || 'signlang-det-training' }}
+      KAGGLE_POLL_INTERVAL_MINUTES: ${{ vars.KAGGLE_POLL_INTERVAL_MINUTES || '15' }}
+      KAGGLE_KERNEL_PRIVATE: ${{ vars.KAGGLE_KERNEL_PRIVATE || 'true' }}
+      KAGGLE_OUTPUT_PART_SIZE_MB: ${{ vars.KAGGLE_OUTPUT_PART_SIZE_MB || '1900' }}
+    steps:
+      - name: Check out repository and tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Kaggle API
+        # v2.2.3 supports the standard kernel-metadata.json machine_shape field.
+        # Pin the release commit so accelerator selection cannot change underneath CD.
+        run: >-
+          python -m pip install --disable-pip-version-check
+          "kaggle @ git+https://github.com/Kaggle/kaggle-cli.git@7b31fdb492b2050a2f0eba2f035a0955da0c9305"
+
+      - name: Requeue requested failed tag
+        if: ${{ inputs.retry_tag != '' }}
+        env:
+          RETRY_TAG: ${{ inputs.retry_tag }}
+        run: python .github/scripts/kaggle_cd.py retry --tag "$RETRY_TAG"
+
+      - name: Advance the CD state machine once
+        env:
+          FORCE_POLL: ${{ inputs.force_poll || false }}
+        run: |
+          if [[ "$FORCE_POLL" == "true" ]]; then
+            python .github/scripts/kaggle_cd.py tick --force
+          else
+            python .github/scripts/kaggle_cd.py tick
+          fi

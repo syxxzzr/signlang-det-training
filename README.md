@@ -12,6 +12,8 @@ The temporary classification heads are used only for optimization. They are not 
 
 The complete workflow is available in [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb).
 
+Tagged revisions can also be delivered automatically: the Kaggle CD workflow serializes runs through one stable notebook, polls them in short scheduled Actions invocations, and publishes completed output to the matching GitHub Release. See [Kaggle Continuous Delivery](docs/KAGGLE_CD.md) for setup and recovery instructions.
+
 ## Highlights ✨
 
 - Shared `hand168-temporal` preprocessing across training, evaluation, and inference
@@ -138,6 +140,7 @@ The datasets remain subject to their original licenses, competition rules, and u
 |---|---|
 | [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb) | Self-contained Kaggle training and export workflow |
 | [README.zh-CN.md](README.zh-CN.md) | Simplified Chinese documentation |
+| [docs/KAGGLE_CD.md](docs/KAGGLE_CD.md) | Tag-driven Kaggle delivery setup and operations |
 | [LICENSE](LICENSE) | Project license |
 
 ## License 📄
