@@ -12,6 +12,8 @@
 
 完整流程见 [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb)。
 
+项目也支持自动交付带 Tag 的版本：Kaggle CD 会通过同一个稳定 Notebook 串行运行任务，以短时定时 Action 轮询状态，并将完成后的输出发布到对应 GitHub Release。配置和故障恢复方法见 [Kaggle 持续交付说明](docs/KAGGLE_CD.md)。
+
 ## 核心特点 ✨
 
 - 训练、评估和推理统一使用 `hand168-temporal` 预处理
@@ -137,6 +139,7 @@ Notebook 会在 `/kaggle/working/signlang-det` 下写入带版本信息的产物
 |---|---|
 | [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb) | 自包含的 Kaggle 训练与导出流程 |
 | [README.md](README.md) | 英文文档 |
+| [docs/KAGGLE_CD.md](docs/KAGGLE_CD.md) | 基于 Tag 的 Kaggle 自动交付配置与运维说明 |
 | [LICENSE](LICENSE) | 项目许可证 |
 
 ## 许可证 📄
