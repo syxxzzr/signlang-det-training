@@ -156,12 +156,11 @@ def run(command: Sequence[str], *, cwd: Optional[Path] = None, input_text: Optio
     return result.stdout
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
     repository: str
     github_token: str
     kaggle_username: str
-    kaggle_key: str
     kernel_slug: str
     kernel_private: bool
     output_part_size_mb: int
@@ -174,7 +173,7 @@ class Config:
     def from_env(cls, *, require_kaggle: bool = True) -> "Config":
         required = ["GITHUB_REPOSITORY", "GH_TOKEN"]
         if require_kaggle:
-            required.extend(["KAGGLE_USERNAME", "KAGGLE_KEY"])
+            required.append("KAGGLE_API_TOKEN")
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
             raise RuntimeError(f"Missing required environment values: {missing}")
@@ -184,8 +183,7 @@ class Config:
         return cls(
             repository=os.environ["GITHUB_REPOSITORY"],
             github_token=os.environ["GH_TOKEN"],
-            kaggle_username=os.environ.get("KAGGLE_USERNAME", ""),
-            kaggle_key=os.environ.get("KAGGLE_KEY", ""),
+            kaggle_username="",
             kernel_slug=os.environ.get("KAGGLE_KERNEL_SLUG", DEFAULT_KERNEL_SLUG),
             kernel_private=parse_bool(os.environ.get("KAGGLE_KERNEL_PRIVATE", "true")),
             output_part_size_mb=part_size,
@@ -270,6 +268,10 @@ class KaggleClient:
         self.config = config
         self.api = KaggleApi()
         self.api.authenticate()
+        username = self.api.config_values.get(self.api.CONFIG_NAME_USER)
+        if not username:
+            raise RuntimeError("Kaggle API token authentication did not resolve an account username")
+        self.config.kaggle_username = str(username)
 
     @staticmethod
     def _not_found(exc: Exception) -> bool:

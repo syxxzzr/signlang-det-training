@@ -129,8 +129,9 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn('cron: "*/10 * * * *"', worker)
         self.assertIn("group: kaggle-cd-worker", worker)
         self.assertIn("cancel-in-progress: false", worker)
-        self.assertIn("secrets.KAGGLE_USERNAME", worker)
-        self.assertIn("secrets.KAGGLE_KEY", worker)
+        self.assertIn("secrets.KAGGLE_API_TOKEN", worker)
+        self.assertNotIn("secrets.KAGGLE_KEY", worker)
+        self.assertNotIn("secrets.KAGGLE_USERNAME", worker)
         self.assertIn("7b31fdb492b2050a2f0eba2f035a0955da0c9305", worker)
         for variable in (
             "KAGGLE_KERNEL_SLUG", "KAGGLE_KERNEL_PRIVATE", "KAGGLE_OUTPUT_PART_SIZE_MB",

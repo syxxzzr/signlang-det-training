@@ -8,8 +8,7 @@ Create these GitHub Actions secrets:
 
 | Secret | Purpose |
 |---|---|
-| `KAGGLE_USERNAME` | Owner of the destination Kaggle kernel |
-| `KAGGLE_KEY` | Kaggle API token |
+| `KAGGLE_API_TOKEN` | API token created in Kaggle Settings; the authenticated account owns the destination kernel |
 
 The Kaggle account must have accepted the rules for [Google - Isolated Sign Language Recognition](https://www.kaggle.com/competitions/asl-signs/data) and be able to access [ASL-preprocessing 7](https://www.kaggle.com/code/abdelrhmankaram/asl-preprocessing-7/output).
 
@@ -17,7 +16,7 @@ Optional GitHub Actions variables:
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `KAGGLE_KERNEL_SLUG` | `signlang-det-training` | Stable destination kernel slug |
+| `KAGGLE_KERNEL_SLUG` | `signlang-det-training` | Stable destination kernel slug under the authenticated account |
 | `KAGGLE_KERNEL_PRIVATE` | `true` | Whether the destination kernel is private |
 | `KAGGLE_OUTPUT_PART_SIZE_MB` | `1900` | Maximum size of each Release archive part |
 
@@ -27,7 +26,7 @@ Kaggle's standard `kernel-metadata.json` sets `machine_shape` to `NvidiaTeslaT4`
 
 Pushing any Git tag creates a draft Release whose JSON body is a durable FIFO queue item. One serialized worker advances a single transition on each invocation:
 
-1. Upload the notebook from the exact tagged commit to `${KAGGLE_USERNAME}/${KAGGLE_KERNEL_SLUG}`.
+1. Resolve the account identity from `KAGGLE_API_TOKEN`, then upload the notebook from the exact tagged commit to that account's `${KAGGLE_KERNEL_SLUG}`.
 2. Record the returned numeric Kaggle version in the draft Release. The Git tag is also injected into the uploaded copy as provenance, because Kaggle version names are numeric and cannot be replaced by arbitrary tag names.
 3. Let the scheduled workflow check the active run every ten minutes.
 4. Download successful output, create a reproducible archive and checksums, upload them as Release assets, and publish the Release.

@@ -24,8 +24,7 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GITHUB_REPOSITORY: ${{ github.repository }}
-      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
-      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_KERNEL_SLUG: ${{ vars.KAGGLE_KERNEL_SLUG || 'signlang-det-training' }}
       KAGGLE_KERNEL_PRIVATE: ${{ vars.KAGGLE_KERNEL_PRIVATE || 'true' }}
       KAGGLE_OUTPUT_PART_SIZE_MB: ${{ vars.KAGGLE_OUTPUT_PART_SIZE_MB || '1900' }}
