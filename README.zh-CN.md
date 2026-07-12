@@ -2,11 +2,11 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个用于训练通用动态手语特征编码器的开源项目，完整流程封装在可独立运行的 Kaggle Notebook 中。
+一个适用于在 Kaggle 中训练通用动态手语特征编码器的开源项目，完整流程封装在可独立运行的 Notebook 中。
 
 ## 项目简介 🚀
 
-本项目用于训练 `signlang_det`：一个面向原型检索的轻量手部时序编码器。编码器先从 Google Isolated Sign Language Recognition 语料中学习通用时序表示，再使用目标 landmark 数据进行领域适配。
+本项目用于训练 `signlang_det`：一个面向原型检索的轻量手部时序编码器，完整流程面向 Kaggle GPU Session 设计。编码器先从 Google Isolated Sign Language Recognition 语料中学习通用时序表示，再使用目标 landmark 数据进行领域适配。
 
 训练期间使用的分类头只提供辅助监督，不会包含在最终导出的编码器中，也不会限制推理阶段可使用的手语词表。
 
@@ -53,7 +53,7 @@ Notebook 从上到下依次完成完整流程：
 
 ### 源语料
 
-Google - Isolated Sign Language Recognition 数据集需要包含：
+[Google - Isolated Sign Language Recognition](https://www.kaggle.com/competitions/asl-signs/data) 竞赛数据集需要包含：
 
 - `train.csv`
 - `sign_to_prediction_index_map.json`
@@ -63,7 +63,7 @@ Google - Isolated Sign Language Recognition 数据集需要包含：
 
 ### 目标 landmark
 
-目标数据集需要提供一个包含 object-NPY 文件的 `landmarks` 目录。每个有效文件必须包含：
+目标数据来自 [ASL-preprocessing 7 output](https://www.kaggle.com/code/abdelrhmankaram/asl-preprocessing-7/output)，需要提供一个包含 object-NPY 文件的 `landmarks` 目录。每个有效文件必须包含：
 
 - 字符串标签；
 - 形状为 `T × 100 × 3` 的 `float32` landmark 数组。
@@ -75,7 +75,7 @@ Google - Isolated Sign Language Recognition 数据集需要包含：
 1. 将 [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb) 导入或上传到 Kaggle。
 2. 挂载源语料和目标 landmark 数据集。
 3. 选择**单张 T4 GPU** 加速器。
-4. 检查配置单元；如果自动发现得到多个候选路径，请显式指定数据集路径。
+4. 检查配置单元。Notebook 会验证 Competition 和 Notebook Output 的标准挂载路径；使用非标准挂载位置时请显式指定路径。
 5. 将 `SMOKE_TEST = True` 可执行短流程集成验证；正式训练时保持 `False`。
 6. 选择 **Run all**，并完整保留 `/kaggle/working/signlang-det` 输出目录。
 
@@ -87,8 +87,8 @@ Notebook 默认设置 `num_workers = 0` 并关闭 DataParallel，以提高 Noteb
 
 | 配置项 | 默认值 | 作用 |
 |---|---:|---|
-| `source_root` | 自动发现 | 包含 Google ASL 元数据和 parquet 文件的根目录 |
-| `target_landmarks` | 自动发现 | 目标 `landmarks` 目录 |
+| `source_root` | Kaggle 标准挂载路径 | 可选的 Google ASL 数据集根目录覆盖值 |
+| `target_landmarks` | Kaggle 标准挂载路径 | 可选的目标 `landmarks` 目录覆盖值 |
 | `work_dir` | `/kaggle/working/signlang-det` | 缓存、checkpoint、指标和导出目录 |
 | `max_frames` | `64` | 最大编码序列长度 |
 | `min_frames` | `12` | 与运行时动作分段器一致的最短动作长度 |
@@ -124,6 +124,12 @@ Notebook 会在 `/kaggle/working/signlang-det` 下写入带版本信息的产物
 - Notebook 不包含动作分段、服务端 API 或原型管理界面。
 - Unknown 手语的距离阈值和 margin 阈值不能从训练 loss 推导，必须使用同时包含已知查询、困难负样本和未知动作的独立数据进行校准。
 - 各训练数据集的许可证和使用限制由其所有者负责；本仓库不重新分发任何训练数据。
+
+## 鸣谢 🙏
+
+感谢 [Google - Isolated Sign Language Recognition](https://www.kaggle.com/competitions/asl-signs/data) 竞赛的组织者和贡献者通过 Kaggle 提供源语料。感谢 [Abdelrhman Karam](https://www.kaggle.com/abdelrhmankaram) 发布用于目标领域适配的 [ASL-preprocessing 7 output](https://www.kaggle.com/code/abdelrhmankaram/asl-preprocessing-7/output)。
+
+所有数据仍受其原始许可证、竞赛规则和使用条款约束。
 
 ## 项目文件 🗂️
 

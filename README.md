@@ -2,11 +2,11 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Training workflow for a reusable dynamic sign language feature encoder, packaged as a self-contained Kaggle notebook.
+Training workflow for a reusable dynamic sign language feature encoder, packaged as a self-contained notebook designed to run on Kaggle.
 
 ## Overview 🚀
 
-This project trains `signlang_det`, a lightweight hand-motion encoder for prototype-based sign retrieval. The encoder learns general temporal representations from the Google Isolated Sign Language Recognition corpus and then adapts them to a target landmark collection.
+This project trains `signlang_det`, a lightweight hand-motion encoder for prototype-based sign retrieval. It is designed for end-to-end training in a Kaggle GPU session. The encoder learns general temporal representations from the Google Isolated Sign Language Recognition corpus and then adapts them to a target landmark collection.
 
 The temporary classification heads are used only for optimization. They are not included in the exported encoder and do not restrict the vocabulary used at inference time.
 
@@ -53,7 +53,7 @@ Attach both datasets to the Kaggle notebook before running it.
 
 ### Source corpus
 
-The Google - Isolated Sign Language Recognition dataset must contain:
+The [Google - Isolated Sign Language Recognition](https://www.kaggle.com/competitions/asl-signs/data) competition dataset must contain:
 
 - `train.csv`
 - `sign_to_prediction_index_map.json`
@@ -63,7 +63,7 @@ Only `left_hand` and `right_hand` landmarks are used. Face and pose landmarks ar
 
 ### Target landmarks
 
-The target dataset must expose a `landmarks` directory containing object-NPY files. Each valid file must provide:
+The target data comes from the [ASL-preprocessing 7 output](https://www.kaggle.com/code/abdelrhmankaram/asl-preprocessing-7/output). It must expose a `landmarks` directory containing object-NPY files. Each valid file must provide:
 
 - a string label;
 - a `float32` landmark array with shape `T × 100 × 3`.
@@ -75,7 +75,7 @@ The default target layout expects right-hand landmarks at indices `0:21` and lef
 1. Import or upload [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb) to Kaggle.
 2. Attach the source corpus and target landmark dataset.
 3. Select a **single T4 GPU** accelerator.
-4. Review the configuration cell and set explicit dataset paths if automatic discovery is ambiguous.
+4. Review the configuration cell. The notebook validates the standard Competition and Notebook Output mount paths; set explicit paths when using a non-standard mount.
 5. Set `SMOKE_TEST = True` for a short integration run, or keep it `False` for the documented training budget.
 6. Choose **Run all** and retain the complete `/kaggle/working/signlang-det` output directory.
 
@@ -87,8 +87,8 @@ The main settings are defined in the `Config` and `TrainSettings` dataclasses ne
 
 | Setting | Default | Purpose |
 |---|---:|---|
-| `source_root` | auto-discover | Root containing Google ASL metadata and parquet files |
-| `target_landmarks` | auto-discover | Target `landmarks` directory |
+| `source_root` | standard Kaggle mount | Optional override for the Google ASL dataset root |
+| `target_landmarks` | standard Kaggle mount | Optional override for the target `landmarks` directory |
 | `work_dir` | `/kaggle/working/signlang-det` | Cache, checkpoint, metric, and export directory |
 | `max_frames` | `64` | Maximum encoded sequence length |
 | `min_frames` | `12` | Minimum accepted action length, matching the runtime segmenter |
@@ -125,6 +125,12 @@ Keep the encoder fingerprint and `hand168-temporal` preprocessing identifier wit
 - The notebook does not provide action segmentation, a serving API, or a prototype management interface.
 - Unknown-sign distance and margin thresholds cannot be inferred from training loss. They require separate calibration data containing known queries, difficult negatives, and unknown actions.
 - Dataset licenses and usage restrictions remain the responsibility of their respective owners. This repository does not redistribute either training dataset.
+
+## Acknowledgements 🙏
+
+We thank the organizers and contributors of the [Google - Isolated Sign Language Recognition](https://www.kaggle.com/competitions/asl-signs/data) competition for making the source corpus available through Kaggle. We also thank [Abdelrhman Karam](https://www.kaggle.com/abdelrhmankaram) for publishing the [ASL-preprocessing 7 output](https://www.kaggle.com/code/abdelrhmankaram/asl-preprocessing-7/output) used for target-domain adaptation.
+
+The datasets remain subject to their original licenses, competition rules, and usage terms.
 
 ## Project Files 🗂️
 
