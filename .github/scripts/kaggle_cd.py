@@ -562,6 +562,41 @@ def create_model_manifest(
         "signlang_det_encoder.rknn": "none",
         "signlang_det_encoder.int8.rknn": "int8",
     }
+    feature_contract = copy.deepcopy(payload["input_contract"])
+    output_contract = copy.deepcopy(payload["output_contract"])
+    fixed_features = copy.deepcopy(feature_contract)
+    fixed_output = copy.deepcopy(output_contract)
+    fixed_features["shape"][0] = 1
+    fixed_output["shape"][0] = 1
+    pt_io = {
+        "inputs": {
+            "features": feature_contract,
+            "lengths": {"dtype": "int32", "shape": ["B"], "minimum": 1, "maximum": 64},
+        },
+        "outputs": {"frame_embeddings": output_contract},
+    }
+    fixed_io = {
+        "inputs": {
+            "features": fixed_features,
+            "lengths": {"dtype": "int32", "shape": [1], "minimum": 1, "maximum": 64},
+        },
+        "outputs": {"frame_embeddings": fixed_output},
+    }
+    int8_io = copy.deepcopy(fixed_io)
+    int8_io["inputs"]["features"]["dtype"] = "int8"
+    int8_io["inputs"]["features"]["quantization_parameters"] = (
+        "embedded; query scale and zero_point with RKNN Runtime"
+    )
+    int8_io["outputs"]["frame_embeddings"]["dtype"] = "int8"
+    int8_io["outputs"]["frame_embeddings"]["quantization_parameters"] = (
+        "embedded; query scale and zero_point with RKNN Runtime"
+    )
+    io_contracts = {
+        "signlang_det_encoder.pt": pt_io,
+        "signlang_det_encoder.onnx": fixed_io,
+        "signlang_det_encoder.rknn": fixed_io,
+        "signlang_det_encoder.int8.rknn": int8_io,
+    }
     models = {}
     for name in RELEASE_MODEL_FILES:
         path = asset_dir / name
@@ -570,6 +605,7 @@ def create_model_manifest(
         models[name] = {
             "format": path.suffix.removeprefix("."),
             "quantization": quantization[name],
+            "io_contract": io_contracts[name],
             "bytes": path.stat().st_size,
             "sha256": sha256_file(path),
         }
