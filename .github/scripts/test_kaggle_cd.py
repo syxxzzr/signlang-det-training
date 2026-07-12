@@ -66,6 +66,18 @@ class QueueTests(unittest.TestCase):
 
 
 class KaggleMetadataTests(unittest.TestCase):
+    def test_treats_token_get_kernel_403_as_a_missing_kernel(self):
+        response = type("Response", (), {"status_code": 403})()
+        error = type("HTTPError", (Exception,), {})("forbidden")
+        error.response = response
+        self.assertTrue(kaggle_cd.KaggleClient._kernel_missing(error))
+
+    def test_does_not_hide_unrelated_api_failures(self):
+        response = type("Response", (), {"status_code": 429})()
+        error = type("HTTPError", (Exception,), {})("rate limited")
+        error.response = response
+        self.assertFalse(kaggle_cd.KaggleClient._kernel_missing(error))
+
     def test_uses_official_kernel_metadata_fields(self):
         metadata = kaggle_cd.build_kernel_metadata(
             username="alice", slug="signlang-det-training", private=True,
