@@ -4,10 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
+import gzip
 import hashlib
+import html
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -16,6 +21,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -27,6 +33,23 @@ DEFAULT_KERNEL_SLUG = "signlang-det-training"
 GOOGLE_ASL_COMPETITION = "asl-signs"
 TARGET_KERNEL_SOURCE = "abdelrhmankaram/asl-preprocessing-7"
 KAGGLE_MACHINE_SHAPE = "NvidiaTeslaT4"
+STATE_MARKER = "signlang-kaggle-cd-state:"
+NOTEBOOK_OUTPUT_FILES = (
+    "signlang_det_encoder.pt",
+    "int8_calibration.tar.gz",
+    "figures/training_curves.png",
+    "figures/retrieval_summary.png",
+    "representation_training/metrics.csv",
+    "domain_adaptation/metrics.csv",
+    "representation_training/train.log",
+    "domain_adaptation/train.log",
+)
+RELEASE_MODEL_FILES = (
+    "signlang_det_encoder.pt",
+    "signlang_det_encoder.onnx",
+    "signlang_det_encoder.rknn",
+    "signlang_det_encoder.int8.rknn",
+)
 
 
 def utcnow() -> datetime:
@@ -49,15 +72,83 @@ def parse_bool(value: str) -> bool:
 def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     if not release.get("draft"):
         return None
+    body = release.get("body") or ""
     try:
-        state = json.loads(release.get("body") or "")
+        state = json.loads(body)
     except (TypeError, json.JSONDecodeError):
-        return None
+        start = body.find(f"<!-- {STATE_MARKER}")
+        end = body.find(" -->", start)
+        if start < 0 or end < 0:
+            return None
+        encoded = body[start + len(f"<!-- {STATE_MARKER}"):end].strip()
+        try:
+            decoded = base64.urlsafe_b64decode(encoded.encode()).decode()
+            state = json.loads(decoded)
+        except (UnicodeDecodeError, binascii.Error, json.JSONDecodeError, ValueError):
+            return None
     if not isinstance(state, dict) or state.get("schema") != STATE_SCHEMA:
         return None
-    if state.get("tag") != release.get("tag_name"):
-        raise RuntimeError(f"CD release {release.get('id')} has a mismatched tag in its state")
+    release_tag = release.get("tag_name")
+    if not isinstance(release_tag, str) or not release_tag:
+        raise RuntimeError(f"CD release {release.get('id')} has no tag_name")
+    if state.get("tag") != release_tag:
+        previous_tag = state.get("tag")
+        print(
+            f"::warning::Repairing CD release {release.get('id')} tag mismatch: "
+            f"state={previous_tag!r}, release={release_tag!r}",
+            file=sys.stderr,
+        )
+        state["tag_recovered_from"] = previous_tag
+        state["tag"] = release_tag
     return state
+
+
+def render_release_body(state: Mapping[str, Any]) -> str:
+    status = str(state.get("state", "unknown"))
+    messages = {
+        "queued": "⏳ Waiting in the delivery queue.",
+        "starting": "🚀 Preparing the tagged notebook for Kaggle.",
+        "running": "🏃 Training is running on Kaggle.",
+        "failed": "❌ Kaggle delivery stopped before completion.",
+    }
+    rows = [
+        f"| Status | **{html.escape(status.title())}** |",
+        f"| Tag | `{html.escape(str(state.get('tag', '—')))}` |",
+        f"| Commit | `{html.escape(str(state.get('git_sha', '—'))[:12])}` |",
+        f"| Attempt | {int(state.get('attempt', 0))} |",
+    ]
+    if state.get("kaggle_version") is not None:
+        rows.append(f"| Kaggle version | `{int(state['kaggle_version'])}` |")
+    if state.get("kaggle_url"):
+        url = html.escape(str(state["kaggle_url"]), quote=True)
+        rows.append(f"| Notebook | [Open on Kaggle]({url}) |")
+
+    sections = [
+        "## Kaggle training delivery",
+        "",
+        messages.get(status, "Kaggle delivery status is being updated."),
+        "",
+        "| | |",
+        "|---|---|",
+        *rows,
+    ]
+    if status == "failed":
+        failure = html.escape(str(state.get("failure") or "No failure detail was reported."))
+        sections.extend([
+            "", "### Failure", "",
+            "> " + failure.replace("\n", "\n> "),
+            "", "Run **Kaggle CD - scheduled worker** with `retry_tag` set to this tag after resolving the problem.",
+        ])
+
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(dict(state), separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    sections.extend(["", "_This draft is maintained automatically by Kaggle CD._", "", f"<!-- {STATE_MARKER}{encoded} -->"])
+    return "\n".join(sections) + "\n"
+
+
+def release_name(state: Mapping[str, Any]) -> str:
+    return f"{state['tag']} · Kaggle training · {str(state['state']).title()}"
 
 
 def cd_releases(releases: Iterable[Mapping[str, Any]]) -> list[tuple[Mapping[str, Any], dict[str, Any]]]:
@@ -116,25 +207,6 @@ def inject_provenance(notebook: Mapping[str, Any], tag: str, git_sha: str, repos
     return output
 
 
-def split_asset(path: Path, max_bytes: int) -> list[Path]:
-    if max_bytes <= 0:
-        raise ValueError("max_bytes must be positive")
-    if path.stat().st_size <= max_bytes:
-        return [path]
-    parts = []
-    with path.open("rb") as source:
-        index = 1
-        while True:
-            chunk = source.read(max_bytes)
-            if not chunk:
-                break
-            part = path.with_name(f"{path.name}.part-{index:04d}")
-            part.write_bytes(chunk)
-            parts.append(part)
-            index += 1
-    return parts
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -163,7 +235,7 @@ class Config:
     kaggle_username: str
     kernel_slug: str
     kernel_private: bool
-    output_part_size_mb: int
+    rknn_target_platform: str
 
     @property
     def kernel_ref(self) -> str:
@@ -177,16 +249,16 @@ class Config:
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
             raise RuntimeError(f"Missing required environment values: {missing}")
-        part_size = int(os.environ.get("KAGGLE_OUTPUT_PART_SIZE_MB", "1900"))
-        if not 1 <= part_size <= 1900:
-            raise ValueError("KAGGLE_OUTPUT_PART_SIZE_MB must be between 1 and 1900")
+        target_platform = os.environ.get("RKNN_TARGET_PLATFORM", "rk3588").strip()
+        if not target_platform:
+            raise ValueError("RKNN_TARGET_PLATFORM must not be empty")
         return cls(
             repository=os.environ["GITHUB_REPOSITORY"],
             github_token=os.environ["GH_TOKEN"],
             kaggle_username="",
             kernel_slug=os.environ.get("KAGGLE_KERNEL_SLUG", DEFAULT_KERNEL_SLUG),
             kernel_private=parse_bool(os.environ.get("KAGGLE_KERNEL_PRIVATE", "true")),
-            output_part_size_mb=part_size,
+            rknn_target_platform=target_platform,
         )
 
 
@@ -236,8 +308,8 @@ class GitHubClient:
         return self.request("POST", "/releases", {
             "tag_name": tag,
             "target_commitish": git_sha,
-            "name": f"{tag} (Kaggle CD queued)",
-            "body": json.dumps(state, indent=2, sort_keys=True),
+            "name": release_name(state),
+            "body": render_release_body(state),
             "draft": True,
             "prerelease": False,
         })
@@ -246,8 +318,8 @@ class GitHubClient:
         payload = dict(state)
         payload["updated_at"] = isoformat()
         return self.request("PATCH", f"/releases/{release_id}", {
-            "body": json.dumps(payload, indent=2, sort_keys=True),
-            "name": f"{payload['tag']} (Kaggle CD {payload['state']})",
+            "body": render_release_body(payload),
+            "name": release_name(payload),
         })
 
     def publish(self, release_id: int, tag: str, body: str) -> dict[str, Any]:
@@ -421,34 +493,222 @@ def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, 
     print(f"Pushed {state['tag']} as Kaggle version {pushed['version']}")
 
 
-def create_release_assets(output_dir: Path, asset_dir: Path, state: Mapping[str, Any], config: Config) -> list[Path]:
-    asset_dir.mkdir(parents=True, exist_ok=True)
-    archive = asset_dir / "kaggle-output.tar.gz"
-    with tarfile.open(archive, "w:gz") as bundle:
-        for path in sorted(output_dir.rglob("*")):
-            if path.is_file():
-                bundle.add(path, arcname=str(path.relative_to(output_dir)))
-    output_assets = split_asset(archive, config.output_part_size_mb * 1024 * 1024)
-    if output_assets != [archive]:
-        archive.unlink()
+def validate_notebook_outputs(output_root: Path) -> None:
+    expected = {Path(relative) for relative in NOTEBOOK_OUTPUT_FILES}
+    actual = {path.relative_to(output_root) for path in output_root.rglob("*") if path.is_file()}
+    if actual != expected:
+        missing = sorted(str(path) for path in expected - actual)
+        unexpected = sorted(str(path) for path in actual - expected)
+        raise RuntimeError(
+            f"Kaggle notebook output allowlist mismatch: missing={missing}, unexpected={unexpected}"
+        )
+
+
+def find_notebook_output_root(download_dir: Path) -> Path:
+    matches = [path.parent for path in download_dir.rglob("signlang_det_encoder.pt")]
+    if len(matches) != 1:
+        raise RuntimeError(f"Expected one notebook output root, found {len(matches)}")
+    validate_notebook_outputs(matches[0])
+    return matches[0]
+
+
+def add_reproducible_file(bundle: tarfile.TarFile, path: Path, arcname: str) -> None:
+    info = bundle.gettarinfo(str(path), arcname=arcname)
+    info.uid = info.gid = 0
+    info.uname = info.gname = ""
+    info.mtime = 0
+    with path.open("rb") as handle:
+        bundle.addfile(info, handle)
+
+
+def create_notebook_output_archive(output_root: Path, archive: Path) -> None:
+    with archive.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as compressed:
+            with tarfile.open(fileobj=compressed, mode="w") as bundle:
+                for relative in NOTEBOOK_OUTPUT_FILES:
+                    if relative != "signlang_det_encoder.pt":
+                        add_reproducible_file(bundle, output_root / relative, relative)
+
+
+def installed_version(distribution: str) -> str:
+    try:
+        return package_version(distribution)
+    except PackageNotFoundError:
+        return "unknown"
+
+
+def create_model_manifest(
+    pt_path: Path,
+    asset_dir: Path,
+    state: Mapping[str, Any],
+    config: Config,
+) -> Path:
+    import torch
+
+    payload = torch.load(pt_path, map_location="cpu", weights_only=False)
+    required = {
+        "preprocessing",
+        "encoder_fingerprint",
+        "model_config",
+        "input_contract",
+        "output_contract",
+    }
+    missing = sorted(required - payload.keys())
+    if missing:
+        raise RuntimeError(f"PT export is missing model manifest fields: {missing}")
+    quantization = {
+        "signlang_det_encoder.pt": "none",
+        "signlang_det_encoder.onnx": "none",
+        "signlang_det_encoder.rknn": "none",
+        "signlang_det_encoder.int8.rknn": "int8",
+    }
+    feature_contract = copy.deepcopy(payload["input_contract"])
+    output_contract = copy.deepcopy(payload["output_contract"])
+    fixed_features = copy.deepcopy(feature_contract)
+    fixed_output = copy.deepcopy(output_contract)
+    fixed_features["shape"][0] = 1
+    fixed_output["shape"][0] = 1
+    pt_io = {
+        "inputs": {
+            "features": feature_contract,
+            "lengths": {"dtype": "int32", "shape": ["B"], "minimum": 1, "maximum": 64},
+        },
+        "outputs": {"frame_embeddings": output_contract},
+    }
+    fixed_io = {
+        "inputs": {
+            "features": fixed_features,
+            "lengths": {"dtype": "int32", "shape": [1], "minimum": 1, "maximum": 64},
+        },
+        "outputs": {"frame_embeddings": fixed_output},
+    }
+    int8_io = copy.deepcopy(fixed_io)
+    int8_io["inputs"]["features"]["dtype"] = "int8"
+    int8_io["inputs"]["features"]["quantization_parameters"] = (
+        "embedded; query scale and zero_point with RKNN Runtime"
+    )
+    int8_io["outputs"]["frame_embeddings"]["dtype"] = "int8"
+    int8_io["outputs"]["frame_embeddings"]["quantization_parameters"] = (
+        "embedded; query scale and zero_point with RKNN Runtime"
+    )
+    io_contracts = {
+        "signlang_det_encoder.pt": pt_io,
+        "signlang_det_encoder.onnx": fixed_io,
+        "signlang_det_encoder.rknn": fixed_io,
+        "signlang_det_encoder.int8.rknn": int8_io,
+    }
+    models = {}
+    for name in RELEASE_MODEL_FILES:
+        path = asset_dir / name
+        if not path.is_file():
+            raise RuntimeError(f"Cannot create model manifest; missing {name}")
+        models[name] = {
+            "format": path.suffix.removeprefix("."),
+            "quantization": quantization[name],
+            "io_contract": io_contracts[name],
+            "bytes": path.stat().st_size,
+            "sha256": sha256_file(path),
+        }
     manifest = {
-        "schema": STATE_SCHEMA,
-        "tag": state["tag"], "git_sha": state["git_sha"],
-        "kaggle_kernel": config.kernel_ref,
+        "schema": "signlang-model-release-v1",
+        "model_identity": {
+            "name": "signlang_det_encoder",
+            "version": state["tag"],
+            "task": "frame_level_sign_language_embedding",
+        },
+        "tag": state["tag"],
+        "git_sha": state["git_sha"],
         "kaggle_version": state["kaggle_version"],
         "kaggle_url": state["kaggle_url"],
-        "created_at": isoformat(),
-        "output_assets": [
-            {"name": path.name, "bytes": path.stat().st_size, "sha256": sha256_file(path)}
-            for path in output_assets
-        ],
+        "rknn_target_platform": config.rknn_target_platform,
+        "preprocessing": payload["preprocessing"],
+        "encoder_fingerprint": payload["encoder_fingerprint"],
+        "architecture": {
+            "name": "HandEncoder",
+            "implementation": ".github/scripts/convert_models.py",
+            "config": payload["model_config"],
+        },
+        "artifacts": {
+            "pytorch_weights": "signlang_det_encoder.pt",
+            "onnx_graph": "signlang_det_encoder.onnx",
+            "rknn_graph": "signlang_det_encoder.rknn",
+            "rknn_int8_graph": "signlang_det_encoder.int8.rknn",
+            "tokenizer": None,
+        },
+        "tokenizer": {
+            "required": False,
+            "location": None,
+            "reason": "The encoder consumes preprocessed hand landmark tensors, not tokens.",
+        },
+        "runtime_dependencies": {
+            "pytorch": ["python==3.10.*", "numpy==1.26.4", "torch==2.4.0"],
+            "onnx": ["python==3.10.*", "numpy==1.26.4", "onnxruntime==1.23.2"],
+            "rknn": [
+                "rknn-toolkit-lite2==2.3.2 or RKNN Runtime==2.3.2",
+                f"target_platform=={config.rknn_target_platform}",
+            ],
+        },
+        "input_contract": payload["input_contract"],
+        "output_contract": payload["output_contract"],
+        "conversion_environment": {
+            "python": ".".join(map(str, sys.version_info[:3])),
+            "onnx": installed_version("onnx"),
+            "onnxruntime": installed_version("onnxruntime"),
+            "rknn_toolkit2": installed_version("rknn-toolkit2"),
+            "setuptools": installed_version("setuptools"),
+        },
+        "models": models,
+        "integrity": {
+            "algorithm": "sha256",
+            "files": {name: metadata["sha256"] for name, metadata in models.items()},
+        },
     }
-    manifest_path = asset_dir / "kaggle-cd-manifest.json"
-    manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    checksum_paths = [*output_assets, manifest_path]
-    sums = asset_dir / "SHA256SUMS"
-    sums.write_text("".join(f"{sha256_file(path)}  {path.name}\n" for path in checksum_paths), encoding="utf-8")
-    return [*output_assets, manifest_path, sums]
+    path = asset_dir / "model-manifest.json"
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return path
+
+
+def create_release_assets(
+    output_dir: Path,
+    asset_dir: Path,
+    state: Mapping[str, Any],
+    config: Config,
+) -> list[Path]:
+    output_root = find_notebook_output_root(output_dir)
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
+    pt_asset = asset_dir / "signlang_det_encoder.pt"
+    shutil.copy2(output_root / pt_asset.name, pt_asset)
+    create_notebook_output_archive(output_root, asset_dir / "notebook-output.tar.gz")
+
+    notebook_text = subprocess.check_output(
+        ["git", "show", f"{state['git_sha']}:{NOTEBOOK_PATH}"], text=True
+    )
+    notebook_asset = asset_dir / NOTEBOOK_PATH
+    notebook_asset.write_text(notebook_text, encoding="utf-8")
+
+    converter = Path(__file__).with_name("convert_models.py")
+    run([
+        sys.executable,
+        str(converter),
+        "--pt", str(pt_asset),
+        "--calibration", str(output_root / "int8_calibration.tar.gz"),
+        "--output-dir", str(asset_dir),
+        "--target-platform", config.rknn_target_platform,
+    ])
+
+    manifest_asset = create_model_manifest(pt_asset, asset_dir, state, config)
+
+    assets = [
+        *[asset_dir / name for name in RELEASE_MODEL_FILES],
+        manifest_asset,
+        notebook_asset,
+        asset_dir / "notebook-output.tar.gz",
+    ]
+    missing = [path.name for path in assets if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Model conversion did not create required Release assets: {missing}")
+    return assets
 
 
 def finalize_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
@@ -466,8 +726,10 @@ def finalize_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[st
         f"- Git commit: `{state['git_sha']}`\n"
         f"- Kaggle kernel: `{config.kernel_ref}`\n"
         f"- Kaggle version: `{state['kaggle_version']}`\n"
-        f"- Kaggle URL: {state['kaggle_url']}\n\n"
-        "Output archives, a manifest, and SHA-256 checksums are attached to this release.\n"
+        f"- Kaggle URL: {state['kaggle_url']}\n"
+        f"- RKNN target platform: `{config.rknn_target_platform}`\n\n"
+        "PT, ONNX, non-quantized RKNN, INT8 RKNN, the model manifest, the tagged notebook, "
+        "and remaining notebook outputs are attached as seven Release assets.\n"
     )
     github.publish(int(release["id"]), str(state["tag"]), body)
     print(f"Published GitHub release {state['tag']}")
