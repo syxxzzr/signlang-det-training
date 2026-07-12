@@ -109,10 +109,12 @@ Notebook 会在 `/kaggle/working/signlang-det` 下写入带版本信息的产物
 - 只包含最终编码器契约和权重的 `signlang_det_encoder.pt`；
 - 确定性数据拆分清单和环境信息；
 - CSV 与 JSONL 指标、状态文件和持久训练日志；
+- `figures/training_curves.png`，展示两次训练的 loss 和验证 Recall@1；
+- `figures/retrieval_summary.png`，对比源语料与目标数据的最终 Recall@1；
+- `figures/plot_data.csv`，保存绘图使用的完整指标行；
 - 两类数据源的拒绝样本清单；
 - 最终检索评估结果；
 - 预处理契约标识和编码器 SHA-256 指纹。
-
 每个动态原型都必须同时保存编码器指纹和 `hand168-temporal` 预处理标识。由其他编码器或预处理契约生成的原型不能与当前导出模型混用。
 
 ## 限制与校准 ⚠️

@@ -109,6 +109,9 @@ The notebook writes versioned artifacts under `/kaggle/working/signlang-det`, in
 - `signlang_det_encoder.pt`, containing only the final encoder contract and weights;
 - deterministic split manifests and environment metadata;
 - CSV and JSONL metrics, status files, and persistent training logs;
+- `figures/training_curves.png`, with loss and validation Recall@1 for both training runs;
+- `figures/retrieval_summary.png`, comparing final source and target Recall@1;
+- `figures/plot_data.csv`, containing the exact metric rows used for plotting;
 - rejected-sample manifests for both data sources;
 - final retrieval evaluation results;
 - the preprocessing contract identifier and encoder SHA-256 fingerprint.
