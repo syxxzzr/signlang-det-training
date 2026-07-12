@@ -15,7 +15,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -37,10 +37,6 @@ def isoformat(value: Optional[datetime] = None) -> str:
     return (value or utcnow()).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def parse_time(value: str) -> datetime:
-    return datetime.fromisoformat(value.replace("Z", "+00:00"))
-
-
 def parse_bool(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized in {"1", "true", "yes", "on"}:
@@ -48,20 +44,6 @@ def parse_bool(value: str) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise ValueError(f"Expected a boolean value, received {value!r}")
-
-
-def validate_poll_interval(minutes: int) -> int:
-    if minutes < 5:
-        raise ValueError("KAGGLE_POLL_INTERVAL_MINUTES must be at least 5")
-    return minutes
-
-
-def poll_due(state: Mapping[str, Any], interval_minutes: int, now: Optional[datetime] = None) -> bool:
-    validate_poll_interval(interval_minutes)
-    last = state.get("last_polled_at")
-    if not last:
-        return True
-    return (now or utcnow()) - parse_time(str(last)) >= timedelta(minutes=interval_minutes)
 
 
 def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
@@ -181,7 +163,6 @@ class Config:
     kaggle_username: str
     kaggle_key: str
     kernel_slug: str
-    poll_interval_minutes: int
     kernel_private: bool
     output_part_size_mb: int
 
@@ -197,7 +178,6 @@ class Config:
         missing = [name for name in required if not os.environ.get(name)]
         if missing:
             raise RuntimeError(f"Missing required environment values: {missing}")
-        interval = validate_poll_interval(int(os.environ.get("KAGGLE_POLL_INTERVAL_MINUTES", "15")))
         part_size = int(os.environ.get("KAGGLE_OUTPUT_PART_SIZE_MB", "1900"))
         if not 1 <= part_size <= 1900:
             raise ValueError("KAGGLE_OUTPUT_PART_SIZE_MB must be between 1 and 1900")
@@ -207,7 +187,6 @@ class Config:
             kaggle_username=os.environ.get("KAGGLE_USERNAME", ""),
             kaggle_key=os.environ.get("KAGGLE_KEY", ""),
             kernel_slug=os.environ.get("KAGGLE_KERNEL_SLUG", DEFAULT_KERNEL_SLUG),
-            poll_interval_minutes=interval,
             kernel_private=parse_bool(os.environ.get("KAGGLE_KERNEL_PRIVATE", "true")),
             output_part_size_mb=part_size,
         )
@@ -478,15 +457,9 @@ def finalize_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[st
     print(f"Published GitHub release {state['tag']}")
 
 
-def poll_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config, force: bool) -> None:
+def poll_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
     if state.get("state") == "starting":
-        if state.get("waiting_for_external_run") and not force and not poll_due(state, config.poll_interval_minutes):
-            print(f"External-run polling is not due for {state['tag']}")
-            return
         start_job(github, kaggle, release, state, config)
-        return
-    if not force and not poll_due(state, config.poll_interval_minutes):
-        print(f"Polling is not due for {state['tag']}; interval={config.poll_interval_minutes} minutes")
         return
     latest = kaggle.latest()
     status = kaggle.status()
@@ -545,7 +518,7 @@ def tick(args: argparse.Namespace) -> None:
         if action == "start":
             start_job(github, kaggle, release, state, config)
         else:
-            poll_job(github, kaggle, release, state, config, force=args.force)
+            poll_job(github, kaggle, release, state, config)
     except Exception as exc:
         # External/transient failures keep active jobs recoverable. Starting failures
         # before a Kaggle version exists are terminal and release the queue.
@@ -563,7 +536,6 @@ def parser() -> argparse.ArgumentParser:
     enqueue_parser.add_argument("--sha", required=True)
     enqueue_parser.set_defaults(handler=enqueue)
     tick_parser = commands.add_parser("tick")
-    tick_parser.add_argument("--force", action="store_true")
     tick_parser.set_defaults(handler=tick)
     retry_parser = commands.add_parser("retry")
     retry_parser.add_argument("--tag", required=True)

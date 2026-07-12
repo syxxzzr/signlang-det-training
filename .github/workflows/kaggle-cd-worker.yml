@@ -2,14 +2,9 @@ name: Kaggle CD - scheduled worker
 
 on:
   schedule:
-    - cron: "*/5 * * * *"
+    - cron: "*/10 * * * *"
   workflow_dispatch:
     inputs:
-      force_poll:
-        description: Ignore the configured poll interval for this tick
-        required: false
-        default: false
-        type: boolean
       retry_tag:
         description: Requeue one failed tag before running this tick
         required: false
@@ -32,7 +27,6 @@ jobs:
       KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
       KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
       KAGGLE_KERNEL_SLUG: ${{ vars.KAGGLE_KERNEL_SLUG || 'signlang-det-training' }}
-      KAGGLE_POLL_INTERVAL_MINUTES: ${{ vars.KAGGLE_POLL_INTERVAL_MINUTES || '15' }}
       KAGGLE_KERNEL_PRIVATE: ${{ vars.KAGGLE_KERNEL_PRIVATE || 'true' }}
       KAGGLE_OUTPUT_PART_SIZE_MB: ${{ vars.KAGGLE_OUTPUT_PART_SIZE_MB || '1900' }}
     steps:
@@ -60,11 +54,4 @@ jobs:
         run: python .github/scripts/kaggle_cd.py retry --tag "$RETRY_TAG"
 
       - name: Advance the CD state machine once
-        env:
-          FORCE_POLL: ${{ inputs.force_poll || false }}
-        run: |
-          if [[ "$FORCE_POLL" == "true" ]]; then
-            python .github/scripts/kaggle_cd.py tick --force
-          else
-            python .github/scripts/kaggle_cd.py tick
-          fi
+        run: python .github/scripts/kaggle_cd.py tick

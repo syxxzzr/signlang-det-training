@@ -3,7 +3,6 @@ import json
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -64,19 +63,6 @@ class QueueTests(unittest.TestCase):
         }])
         self.assertIsNone(selected)
         self.assertEqual(action, "idle")
-
-
-class PollTests(unittest.TestCase):
-    def test_poll_interval_is_adjustable(self):
-        now = datetime(2026, 1, 1, 0, 20, tzinfo=timezone.utc)
-        state = {"last_polled_at": "2026-01-01T00:10:00Z"}
-        self.assertFalse(kaggle_cd.poll_due(state, 15, now))
-        self.assertTrue(kaggle_cd.poll_due(state, 10, now))
-        self.assertTrue(kaggle_cd.poll_due({}, 60, now))
-
-    def test_poll_interval_must_be_at_least_five_minutes(self):
-        with self.assertRaisesRegex(ValueError, "at least 5"):
-            kaggle_cd.validate_poll_interval(4)
 
 
 class KaggleMetadataTests(unittest.TestCase):
@@ -140,15 +126,14 @@ class WorkflowTests(unittest.TestCase):
         worker = (root / ".github/workflows/kaggle-cd-worker.yml").read_text()
         self.assertIn("tags:\n      - \"*\"", enqueue)
         self.assertIn("actions: write", enqueue)
-        self.assertIn('cron: "*/5 * * * *"', worker)
+        self.assertIn('cron: "*/10 * * * *"', worker)
         self.assertIn("group: kaggle-cd-worker", worker)
         self.assertIn("cancel-in-progress: false", worker)
         self.assertIn("secrets.KAGGLE_USERNAME", worker)
         self.assertIn("secrets.KAGGLE_KEY", worker)
         self.assertIn("7b31fdb492b2050a2f0eba2f035a0955da0c9305", worker)
         for variable in (
-            "KAGGLE_KERNEL_SLUG", "KAGGLE_POLL_INTERVAL_MINUTES",
-            "KAGGLE_KERNEL_PRIVATE", "KAGGLE_OUTPUT_PART_SIZE_MB",
+            "KAGGLE_KERNEL_SLUG", "KAGGLE_KERNEL_PRIVATE", "KAGGLE_OUTPUT_PART_SIZE_MB",
         ):
             self.assertIn(f"vars.{variable}", worker)
 

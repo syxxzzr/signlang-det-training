@@ -18,7 +18,6 @@ Optional GitHub Actions variables:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `KAGGLE_KERNEL_SLUG` | `signlang-det-training` | Stable destination kernel slug |
-| `KAGGLE_POLL_INTERVAL_MINUTES` | `15` | Minimum time between Kaggle API status checks; minimum `5` |
 | `KAGGLE_KERNEL_PRIVATE` | `true` | Whether the destination kernel is private |
 | `KAGGLE_OUTPUT_PART_SIZE_MB` | `1900` | Maximum size of each Release archive part |
 
@@ -30,7 +29,7 @@ Pushing any Git tag creates a draft Release whose JSON body is a durable FIFO qu
 
 1. Upload the notebook from the exact tagged commit to `${KAGGLE_USERNAME}/${KAGGLE_KERNEL_SLUG}`.
 2. Record the returned numeric Kaggle version in the draft Release. The Git tag is also injected into the uploaded copy as provenance, because Kaggle version names are numeric and cannot be replaced by arbitrary tag names.
-3. Let the scheduled workflow wake every five minutes. It contacts Kaggle only when the configured polling interval has elapsed.
+3. Let the scheduled workflow check the active run every ten minutes.
 4. Download successful output, create a reproducible archive and checksums, upload them as Release assets, and publish the Release.
 
 Only one queue item may be `starting` or `running`. Later tags remain queued. An already-running external version of the same stable kernel is allowed to finish before the queue continues.
@@ -45,7 +44,7 @@ tar -xzf kaggle-output.tar.gz
 
 ## Operations
 
-Use **Kaggle CD - scheduled worker → Run workflow** to request an immediate poll. This bypasses the configured interval for that invocation but still performs only one status check.
+Use **Kaggle CD - scheduled worker → Run workflow** to request an immediate poll. Each invocation still performs only one status check.
 
 If a job reaches `failed`, run the same workflow with `retry_tag` set to its exact Git tag. The failed draft Release is returned to the queue. Transient API failures while a Kaggle version is active leave it recoverable for the next scheduled run.
 
