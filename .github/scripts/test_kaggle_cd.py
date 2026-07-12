@@ -4,6 +4,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 SCRIPT = Path(__file__).with_name("kaggle_cd.py")
@@ -120,6 +122,29 @@ class KaggleMetadataTests(unittest.TestCase):
 
 
 class CoordinatorTests(unittest.TestCase):
+    def test_terminal_start_failure_updates_release_and_fails_worker(self):
+        item = release(1, "v1.0.0", "queued", "2026-01-01T00:00:00Z")
+
+        class GitHub:
+            def __init__(self): self.states = []
+            def list_releases(self): return [item]
+            def update_state(self, _release_id, value): self.states.append(dict(value))
+
+        class Kaggle:
+            def latest(self): raise RuntimeError("Kaggle unavailable")
+
+        github = GitHub()
+        with (
+            mock.patch.object(kaggle_cd.Config, "from_env", return_value=object()),
+            mock.patch.object(kaggle_cd, "GitHubClient", return_value=github),
+            mock.patch.object(kaggle_cd, "KaggleClient", return_value=Kaggle()),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Kaggle unavailable"):
+                kaggle_cd.tick(SimpleNamespace())
+
+        self.assertEqual(github.states[-1]["state"], "failed")
+        self.assertIn("RuntimeError: Kaggle unavailable", github.states[-1]["failure"])
+
     def test_waiting_for_external_run_does_not_increment_attempt(self):
         item = release(1, "v1.0.0", "starting", "2026-01-01T00:00:00Z")
         state = kaggle_cd.state_for_release(item)
