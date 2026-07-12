@@ -14,7 +14,7 @@ The complete workflow is available in [signlang_det_kaggle_training.ipynb](signl
 
 ## Highlights ✨
 
-- Shared `hand168-v2` preprocessing across training, evaluation, and inference
+- Shared `hand168-temporal` preprocessing across training, evaluation, and inference
 - Wrist-relative normalization for two hands with explicit missing-hand handling
 - Shared hand TCN branches followed by masked Transformer fusion
 - Cross-entropy, supervised contrastive, and batch-hard triplet objectives
@@ -28,7 +28,7 @@ The complete workflow is available in [signlang_det_kaggle_training.ipynb](signl
 The notebook runs the complete pipeline from top to bottom:
 
 1. Validate the Kaggle CUDA runtime and selected GPU architecture.
-2. Convert Google ASL parquet sequences into a resumable `hand168-v2` cache.
+2. Convert Google ASL parquet sequences into a resumable `hand168-temporal` cache.
 3. Train general hand-motion representations with P-by-K sampling.
 4. Select and evaluate the encoder on classes excluded from training.
 5. Audit and preprocess the target object-NPY landmark collection.
@@ -91,7 +91,8 @@ The main settings are defined in the `Config` and `TrainSettings` dataclasses ne
 | `target_landmarks` | auto-discover | Target `landmarks` directory |
 | `work_dir` | `/kaggle/working/signlang-det` | Cache, checkpoint, metric, and export directory |
 | `max_frames` | `64` | Maximum encoded sequence length |
-| `min_frames` | `4` | Minimum accepted action length |
+| `min_frames` | `12` | Minimum accepted action length, matching the runtime segmenter |
+| `max_input_frames` | `120` | Maximum accepted action length before rejection |
 | `embedding_dim` | `128` | Frame and pooled feature dimension |
 | `top_k` | `20` | Number of pooled candidates reranked with DTW |
 | `dtw_window` | `12` | Constrained DTW window |
@@ -110,9 +111,9 @@ The notebook writes versioned artifacts under `/kaggle/working/signlang-det`, in
 - CSV and JSONL metrics, status files, and persistent training logs;
 - rejected-sample manifests for both data sources;
 - final retrieval evaluation results;
-- the preprocessing version and encoder SHA-256 fingerprint.
+- the preprocessing contract identifier and encoder SHA-256 fingerprint.
 
-Keep the encoder fingerprint and `hand168-v2` version with every dynamic prototype. A prototype produced by a different encoder or preprocessing version must not be mixed with the exported model.
+Keep the encoder fingerprint and `hand168-temporal` preprocessing identifier with every dynamic prototype. A prototype produced by a different encoder or preprocessing contract must not be mixed with the exported model.
 
 ## Limitations and Calibration ⚠️
 

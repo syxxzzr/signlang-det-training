@@ -14,7 +14,7 @@
 
 ## 核心特点 ✨
 
-- 训练、评估和推理统一使用 `hand168-v2` 预处理
+- 训练、评估和推理统一使用 `hand168-temporal` 预处理
 - 采用腕点相对归一化，并显式处理左右手缺失情况
 - 左右手共享 TCN 分支，随后通过带掩码的 Transformer 融合
 - 联合使用交叉熵、监督对比损失和 batch-hard triplet 损失
@@ -28,7 +28,7 @@
 Notebook 从上到下依次完成完整流程：
 
 1. 检查 Kaggle CUDA 环境和所选 GPU 架构。
-2. 将 Google ASL parquet 序列转换为可恢复的 `hand168-v2` 缓存。
+2. 将 Google ASL parquet 序列转换为可恢复的 `hand168-temporal` 缓存。
 3. 使用 P×K 采样训练通用手部时序表示。
 4. 在训练时未出现的类别上选择并评估编码器。
 5. 审计并预处理目标 object-NPY landmark 数据。
@@ -91,7 +91,8 @@ Notebook 默认设置 `num_workers = 0` 并关闭 DataParallel，以提高 Noteb
 | `target_landmarks` | 自动发现 | 目标 `landmarks` 目录 |
 | `work_dir` | `/kaggle/working/signlang-det` | 缓存、checkpoint、指标和导出目录 |
 | `max_frames` | `64` | 最大编码序列长度 |
-| `min_frames` | `4` | 可接受动作的最短长度 |
+| `min_frames` | `12` | 与运行时动作分段器一致的最短动作长度 |
+| `max_input_frames` | `120` | 拒绝样本前允许的最大动作长度 |
 | `embedding_dim` | `128` | 帧级和池化特征维度 |
 | `top_k` | `20` | 进入 DTW 重排的池化候选数量 |
 | `dtw_window` | `12` | 受限 DTW 窗口 |
@@ -110,9 +111,9 @@ Notebook 会在 `/kaggle/working/signlang-det` 下写入带版本信息的产物
 - CSV 与 JSONL 指标、状态文件和持久训练日志；
 - 两类数据源的拒绝样本清单；
 - 最终检索评估结果；
-- 预处理版本和编码器 SHA-256 指纹。
+- 预处理契约标识和编码器 SHA-256 指纹。
 
-每个动态原型都必须同时保存编码器指纹和 `hand168-v2` 版本。由其他编码器或预处理版本生成的原型不能与当前导出模型混用。
+每个动态原型都必须同时保存编码器指纹和 `hand168-temporal` 预处理标识。由其他编码器或预处理契约生成的原型不能与当前导出模型混用。
 
 ## 限制与校准 ⚠️
 
