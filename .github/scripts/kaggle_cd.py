@@ -540,7 +540,6 @@ def tick(args: argparse.Namespace) -> None:
         # before a Kaggle version exists are terminal and release the queue.
         if state.get("state") == "starting" and not state.get("kaggle_version"):
             mark_failed(github, release, state, f"{type(exc).__name__}: {exc}")
-            return
         raise
 
 
