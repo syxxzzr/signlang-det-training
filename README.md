@@ -85,7 +85,7 @@ The notebook defaults to `num_workers = 0` and disables DataParallel for stable 
 
 ## Configuration ⚙️
 
-The main settings are defined in the `Config` and `TrainSettings` dataclasses near the top of the notebook.
+The main settings are defined in the configuration cells near the top of the notebook.
 
 | Setting | Default | Purpose |
 |---|---:|---|
@@ -100,23 +100,21 @@ The main settings are defined in the `Config` and `TrainSettings` dataclasses ne
 | `dtw_window` | `12` | Constrained DTW window |
 | `resume` | `True` | Restore compatible training state |
 | `use_data_parallel` | `False` | Optional dual-GPU execution |
+| `int8_calibration_samples` | `100` | Deterministic target-training samples packaged for RKNN INT8 calibration |
 
 Production defaults use 30 epochs × 300 batches for representation training and 40 epochs × 200 batches for adaptation. These epochs contain a fixed number of P-by-K batches and do not represent full dataset passes.
 
 ## Outputs 📦
 
-The notebook writes versioned artifacts under `/kaggle/working/signlang-det`, including:
+After verifying the exported encoder, the notebook removes caches, checkpoints, state files, and other intermediate data. `/kaggle/working/signlang-det` then contains only:
 
-- immutable epoch checkpoints plus `latest.pt` and `best.pt`;
-- `signlang_det_encoder.pt`, containing only the final encoder contract and weights;
-- deterministic split manifests and environment metadata;
-- CSV and JSONL metrics, status files, and persistent training logs;
-- `figures/training_curves.png`, with loss and validation Recall@1 for both training runs;
-- `figures/retrieval_summary.png`, comparing final source and target Recall@1;
-- `figures/plot_data.csv`, containing the exact metric rows used for plotting;
-- rejected-sample manifests for both data sources;
-- final retrieval evaluation results;
-- the preprocessing contract identifier and encoder SHA-256 fingerprint.
+- `signlang_det_encoder.pt`, containing the final encoder contract, weights, and fingerprint;
+- `int8_calibration.tar.gz`, containing up to 100 deterministic target-training inputs and an RKNN dataset list;
+- `figures/training_curves.png` and `figures/retrieval_summary.png`;
+- `representation_training/metrics.csv` and `domain_adaptation/metrics.csv`;
+- `representation_training/train.log` and `domain_adaptation/train.log`.
+
+Kaggle CD converts the PT model to ONNX and then to non-quantized and INT8 RKNN models. The four models, `model-manifest.json`, and original tagged notebook are uploaded separately; all remaining notebook outputs are placed in `notebook-output.tar.gz`.
 
 Keep the encoder fingerprint and `hand168-temporal` preprocessing identifier with every dynamic prototype. A prototype produced by a different encoder or preprocessing contract must not be mixed with the exported model.
 

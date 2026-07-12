@@ -233,7 +233,7 @@ def _build_one_rknn(
 ) -> None:
     if RKNN is None:
         raise RuntimeError("rknn-toolkit2 is required for RKNN conversion")
-    converter = RKNN(verbose=True)
+    converter = RKNN(verbose=False)
     try:
         _require_success(converter.config(target_platform=target_platform), "config")
         _require_success(converter.load_onnx(model=str(onnx_path)), "load_onnx")

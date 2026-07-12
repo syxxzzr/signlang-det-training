@@ -27,23 +27,29 @@ jobs:
       KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_KERNEL_SLUG: ${{ vars.KAGGLE_KERNEL_SLUG || 'signlang-det-training' }}
       KAGGLE_KERNEL_PRIVATE: ${{ vars.KAGGLE_KERNEL_PRIVATE || 'true' }}
-      KAGGLE_OUTPUT_PART_SIZE_MB: ${{ vars.KAGGLE_OUTPUT_PART_SIZE_MB || '1900' }}
+      RKNN_TARGET_PLATFORM: ${{ vars.RKNN_TARGET_PLATFORM || 'rk3588' }}
     steps:
       - name: Check out repository and tags
         uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
-      - name: Set up Python
+      - name: Set up Python 3.10
         uses: actions/setup-python@v6
         with:
-          python-version: "3.11"
+          python-version: "3.10"
 
-      - name: Install Kaggle API
+      - name: Install Kaggle API and model conversion environment
         # v2.2.3 supports the standard kernel-metadata.json machine_shape field.
         # Pin the release commit so accelerator selection cannot change underneath CD.
         run: >-
           python -m pip install --disable-pip-version-check
+          "setuptools<81"
+          "numpy==1.26.4"
+          "torch==2.4.0"
+          "onnx==1.16.1"
+          "onnxruntime==1.23.2"
+          "rknn-toolkit2==2.3.2"
           "kaggle @ git+https://github.com/Kaggle/kaggle-cli.git@7b31fdb492b2050a2f0eba2f035a0955da0c9305"
 
       - name: Requeue requested failed tag
