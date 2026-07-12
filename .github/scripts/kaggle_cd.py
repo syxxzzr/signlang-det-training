@@ -274,8 +274,17 @@ class KaggleClient:
         self.config.kaggle_username = str(username)
 
     @staticmethod
-    def _not_found(exc: Exception) -> bool:
-        return getattr(exc, "status", None) == 404 or getattr(exc, "status_code", None) == 404
+    def _kernel_missing(exc: Exception) -> bool:
+        response = getattr(exc, "response", None)
+        status = (
+            getattr(exc, "status", None)
+            or getattr(exc, "status_code", None)
+            or getattr(response, "status_code", None)
+        )
+        # GetKernel hides a nonexistent kernel behind 403 for some access-token
+        # requests. The owner is always the authenticated token user, so this
+        # cannot mask an attempt to read another account's private kernel.
+        return status in {403, 404}
 
     def latest(self) -> Optional[dict[str, Any]]:
         from kagglesdk.kernels.types.kernels_api_service import ApiGetKernelRequest
@@ -287,7 +296,7 @@ class KaggleClient:
             with self.api.build_kaggle_client() as client:
                 response = client.kernels.kernels_api_client.get_kernel(request)
         except Exception as exc:
-            if self._not_found(exc):
+            if self._kernel_missing(exc):
                 return None
             raise
         try:
@@ -304,7 +313,7 @@ class KaggleClient:
         try:
             response = self.api.kernels_status(self.config.kernel_ref)
         except Exception as exc:
-            if self._not_found(exc):
+            if self._kernel_missing(exc):
                 return {"status": "missing", "failure_message": ""}
             raise
         return {
