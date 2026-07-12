@@ -69,8 +69,18 @@ def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
             return None
     if not isinstance(state, dict) or state.get("schema") != STATE_SCHEMA:
         return None
-    if state.get("tag") != release.get("tag_name"):
-        raise RuntimeError(f"CD release {release.get('id')} has a mismatched tag in its state")
+    release_tag = release.get("tag_name")
+    if not isinstance(release_tag, str) or not release_tag:
+        raise RuntimeError(f"CD release {release.get('id')} has no tag_name")
+    if state.get("tag") != release_tag:
+        previous_tag = state.get("tag")
+        print(
+            f"::warning::Repairing CD release {release.get('id')} tag mismatch: "
+            f"state={previous_tag!r}, release={release_tag!r}",
+            file=sys.stderr,
+        )
+        state["tag_recovered_from"] = previous_tag
+        state["tag"] = release_tag
     return state
 
 

@@ -33,6 +33,8 @@ Pushing any Git tag creates a readable draft Release backed by hidden machine st
 
 Only one queue item may be `starting` or `running`. Later tags remain queued. An already-running external version of the same stable kernel is allowed to finish before the queue continues.
 
+If a draft Release's hidden tag becomes stale after a GitHub-side edit or migration, the worker repairs it from the Release's current `tag_name`. Before any upload, the resolved Git tag commit must still exactly match the queued `git_sha`.
+
 Release assets contain `kaggle-output.tar.gz` or numbered parts, `kaggle-cd-manifest.json`, and `SHA256SUMS`. Reconstruct a split archive with:
 
 ```bash
