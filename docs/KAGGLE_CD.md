@@ -24,7 +24,7 @@ Kaggle's standard `kernel-metadata.json` sets `machine_shape` to `NvidiaTeslaT4`
 
 ## Delivery flow
 
-Pushing any Git tag creates a draft Release whose JSON body is a durable FIFO queue item. One serialized worker advances a single transition on each invocation:
+Pushing any Git tag creates a readable draft Release backed by hidden machine state as a durable FIFO queue item. One serialized worker advances a single transition on each invocation:
 
 1. Resolve the account identity from `KAGGLE_API_TOKEN`, then upload the notebook from the exact tagged commit to that account's `${KAGGLE_KERNEL_SLUG}`.
 2. Record the returned numeric Kaggle version in the draft Release. The Git tag is also injected into the uploaded copy as provenance, because Kaggle version names are numeric and cannot be replaced by arbitrary tag names.

@@ -32,6 +32,29 @@ def release(release_id, tag, state, created_at):
 
 
 class QueueTests(unittest.TestCase):
+    def test_rendered_release_is_readable_and_round_trips_hidden_state(self):
+        state = {
+            "schema": kaggle_cd.STATE_SCHEMA,
+            "state": "failed",
+            "tag": "v1.0.0",
+            "git_sha": "a" * 40,
+            "attempt": 2,
+            "failure": "Kaggle was unavailable",
+        }
+        body = kaggle_cd.render_release_body(state)
+        parsed = kaggle_cd.parse_release_state({
+            "id": 1, "draft": True, "tag_name": "v1.0.0", "body": body,
+        })
+        self.assertEqual(parsed, state)
+        self.assertIn("## Kaggle training delivery", body)
+        self.assertIn("### Failure", body)
+        self.assertIn("Kaggle was unavailable", body)
+        self.assertNotIn(kaggle_cd.STATE_SCHEMA, body)
+
+    def test_legacy_json_release_state_remains_supported(self):
+        item = release(1, "v1.0.0", "queued", "2026-01-01T00:00:00Z")
+        self.assertEqual(kaggle_cd.parse_release_state(item)["state"], "queued")
+
     def test_selects_only_active_release(self):
         releases = [
             release(1, "v1.0.0", "queued", "2026-01-01T00:00:00Z"),

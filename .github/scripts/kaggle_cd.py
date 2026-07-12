@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import copy
 import hashlib
+import html
 import json
 import os
 import subprocess
@@ -27,6 +30,7 @@ DEFAULT_KERNEL_SLUG = "signlang-det-training"
 GOOGLE_ASL_COMPETITION = "asl-signs"
 TARGET_KERNEL_SOURCE = "abdelrhmankaram/asl-preprocessing-7"
 KAGGLE_MACHINE_SHAPE = "NvidiaTeslaT4"
+STATE_MARKER = "signlang-kaggle-cd-state:"
 
 
 def utcnow() -> datetime:
@@ -49,15 +53,73 @@ def parse_bool(value: str) -> bool:
 def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     if not release.get("draft"):
         return None
+    body = release.get("body") or ""
     try:
-        state = json.loads(release.get("body") or "")
+        state = json.loads(body)
     except (TypeError, json.JSONDecodeError):
-        return None
+        start = body.find(f"<!-- {STATE_MARKER}")
+        end = body.find(" -->", start)
+        if start < 0 or end < 0:
+            return None
+        encoded = body[start + len(f"<!-- {STATE_MARKER}"):end].strip()
+        try:
+            decoded = base64.urlsafe_b64decode(encoded.encode()).decode()
+            state = json.loads(decoded)
+        except (UnicodeDecodeError, binascii.Error, json.JSONDecodeError, ValueError):
+            return None
     if not isinstance(state, dict) or state.get("schema") != STATE_SCHEMA:
         return None
     if state.get("tag") != release.get("tag_name"):
         raise RuntimeError(f"CD release {release.get('id')} has a mismatched tag in its state")
     return state
+
+
+def render_release_body(state: Mapping[str, Any]) -> str:
+    status = str(state.get("state", "unknown"))
+    messages = {
+        "queued": "⏳ Waiting in the delivery queue.",
+        "starting": "🚀 Preparing the tagged notebook for Kaggle.",
+        "running": "🏃 Training is running on Kaggle.",
+        "failed": "❌ Kaggle delivery stopped before completion.",
+    }
+    rows = [
+        f"| Status | **{html.escape(status.title())}** |",
+        f"| Tag | `{html.escape(str(state.get('tag', '—')))}` |",
+        f"| Commit | `{html.escape(str(state.get('git_sha', '—'))[:12])}` |",
+        f"| Attempt | {int(state.get('attempt', 0))} |",
+    ]
+    if state.get("kaggle_version") is not None:
+        rows.append(f"| Kaggle version | `{int(state['kaggle_version'])}` |")
+    if state.get("kaggle_url"):
+        url = html.escape(str(state["kaggle_url"]), quote=True)
+        rows.append(f"| Notebook | [Open on Kaggle]({url}) |")
+
+    sections = [
+        "## Kaggle training delivery",
+        "",
+        messages.get(status, "Kaggle delivery status is being updated."),
+        "",
+        "| | |",
+        "|---|---|",
+        *rows,
+    ]
+    if status == "failed":
+        failure = html.escape(str(state.get("failure") or "No failure detail was reported."))
+        sections.extend([
+            "", "### Failure", "",
+            "> " + failure.replace("\n", "\n> "),
+            "", "Run **Kaggle CD - scheduled worker** with `retry_tag` set to this tag after resolving the problem.",
+        ])
+
+    encoded = base64.urlsafe_b64encode(
+        json.dumps(dict(state), separators=(",", ":"), sort_keys=True).encode()
+    ).decode()
+    sections.extend(["", "_This draft is maintained automatically by Kaggle CD._", "", f"<!-- {STATE_MARKER}{encoded} -->"])
+    return "\n".join(sections) + "\n"
+
+
+def release_name(state: Mapping[str, Any]) -> str:
+    return f"{state['tag']} · Kaggle training · {str(state['state']).title()}"
 
 
 def cd_releases(releases: Iterable[Mapping[str, Any]]) -> list[tuple[Mapping[str, Any], dict[str, Any]]]:
@@ -236,8 +298,8 @@ class GitHubClient:
         return self.request("POST", "/releases", {
             "tag_name": tag,
             "target_commitish": git_sha,
-            "name": f"{tag} (Kaggle CD queued)",
-            "body": json.dumps(state, indent=2, sort_keys=True),
+            "name": release_name(state),
+            "body": render_release_body(state),
             "draft": True,
             "prerelease": False,
         })
@@ -246,8 +308,8 @@ class GitHubClient:
         payload = dict(state)
         payload["updated_at"] = isoformat()
         return self.request("PATCH", f"/releases/{release_id}", {
-            "body": json.dumps(payload, indent=2, sort_keys=True),
-            "name": f"{payload['tag']} (Kaggle CD {payload['state']})",
+            "body": render_release_body(payload),
+            "name": release_name(payload),
         })
 
     def publish(self, release_id: int, tag: str, body: str) -> dict[str, Any]:
