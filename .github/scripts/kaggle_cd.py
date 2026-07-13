@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as package_version
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional, Sequence
+from typing import Any, Iterable, Mapping, NoReturn, Optional, Sequence
 
 
 STATE_SCHEMA = "signlang-kaggle-cd-v1"
@@ -57,6 +57,15 @@ RELEASE_ASSET_FILES = (
     *RELEASE_MODEL_FILES,
     NOTEBOOK_PATH,
     "notebook-output.tar.gz",
+)
+DELIVERY_CONFIG_KEYS = ("kaggle_kernel", "rknn_target_platform")
+RELEASE_IMMUTABLE_KEYS = (
+    "tag",
+    "git_sha",
+    "kaggle_kernel",
+    "kaggle_version",
+    "kaggle_url",
+    "rknn_target_platform",
 )
 
 
@@ -129,8 +138,12 @@ def render_release_body(state: Mapping[str, Any]) -> str:
         f"| Commit | `{html.escape(str(state.get('git_sha', '—'))[:12])}` |",
         f"| Attempt | {int(state.get('attempt', 0))} |",
     ]
+    if state.get("kaggle_kernel"):
+        rows.append(f"| Kaggle kernel | `{html.escape(str(state['kaggle_kernel']))}` |")
     if state.get("kaggle_version") is not None:
         rows.append(f"| Kaggle version | `{int(state['kaggle_version'])}` |")
+    if state.get("rknn_target_platform"):
+        rows.append(f"| RKNN target | `{html.escape(str(state['rknn_target_platform']))}` |")
     if state.get("kaggle_url"):
         url = html.escape(str(state["kaggle_url"]), quote=True)
         rows.append(f"| Notebook | [Open on Kaggle]({url}) |")
@@ -379,6 +392,7 @@ class KaggleClient:
                 return None
             raise
         return {
+            "kaggle_kernel": self.config.kernel_ref,
             "version": int(response.metadata.current_version_number),
             "url": f"https://www.kaggle.com/code/{self.config.kernel_ref}",
         }
@@ -450,17 +464,79 @@ def latest_version(latest: Optional[Mapping[str, Any]]) -> Optional[int]:
     return int(latest["version"])
 
 
+def expected_delivery_config(config: Config) -> dict[str, str]:
+    return {
+        "kaggle_kernel": config.kernel_ref,
+        "rknn_target_platform": config.rknn_target_platform,
+    }
+
+
+def reconcile_delivery_config(state: dict[str, Any], config: Config) -> bool:
+    expected = expected_delivery_config(config)
+    changed = False
+    recorded_kernel = state.get("kaggle_kernel")
+    if not recorded_kernel:
+        if state.get("kaggle_version") is not None:
+            raise TerminalDeliveryError(
+                f"Tag {state.get('tag')!r} records Kaggle version "
+                f"{state.get('kaggle_version')!r} without a kernel identity"
+            )
+        state["kaggle_kernel"] = expected["kaggle_kernel"]
+        changed = True
+    recorded_target = state.get("rknn_target_platform")
+    if not recorded_target:
+        state["rknn_target_platform"] = expected["rknn_target_platform"]
+        changed = True
+
+    mismatched = [
+        key for key in DELIVERY_CONFIG_KEYS if state.get(key) != expected[key]
+    ]
+    if mismatched:
+        detail = ", ".join(
+            f"{key}: locked={state.get(key)!r}, current={expected[key]!r}"
+            for key in mismatched
+        )
+        raise TerminalDeliveryError(
+            f"Delivery configuration changed for tag {state.get('tag')!r}: {detail}"
+        )
+    return changed
+
+
+def require_delivery_config(state: Mapping[str, Any], config: Config) -> None:
+    expected = expected_delivery_config(config)
+    missing = [key for key in DELIVERY_CONFIG_KEYS if not state.get(key)]
+    mismatched = [
+        key for key in DELIVERY_CONFIG_KEYS
+        if state.get(key) and state.get(key) != expected[key]
+    ]
+    if missing or mismatched:
+        raise TerminalDeliveryError(
+            f"Delivery identity is not locked to the current configuration for tag "
+            f"{state.get('tag')!r}: missing={missing}, mismatched={mismatched}"
+        )
+
+
 def version_matches(latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]) -> bool:
     expected = state.get("kaggle_version")
-    return expected is not None and latest_version(latest) == int(expected)
+    expected_kernel = state.get("kaggle_kernel")
+    return (
+        latest is not None
+        and expected is not None
+        and expected_kernel is not None
+        and latest.get("kaggle_kernel") == expected_kernel
+        and latest_version(latest) == int(expected)
+    )
 
 
 def version_mismatch_message(
     latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]
 ) -> str:
+    actual_kernel = None if latest is None else latest.get("kaggle_kernel")
     return (
-        f"Kaggle latest version {latest_version(latest)!r} does not match "
-        f"expected version {state.get('kaggle_version')!r} for tag {state.get('tag')!r}"
+        f"Kaggle latest identity "
+        f"{actual_kernel!r}@{latest_version(latest)!r} "
+        f"does not match expected {state.get('kaggle_kernel')!r}@"
+        f"{state.get('kaggle_version')!r} for tag {state.get('tag')!r}"
     )
 
 
@@ -475,24 +551,45 @@ def fail_job(
     release: Mapping[str, Any],
     state: dict[str, Any],
     message: str,
-) -> None:
+) -> NoReturn:
     mark_failed(github, release, state, message)
     raise RuntimeError(message)
 
 
+def persist_running_state(
+    github: GitHubClient,
+    release: Mapping[str, Any],
+    state: dict[str, Any],
+) -> None:
+    try:
+        github.update_state(int(release["id"]), state)
+    except Exception:
+        # Preserve the startup failure path when Kaggle returned a version but
+        # GitHub did not acknowledge the running state. The outer tick can then
+        # record a failed state containing that exact version for a safe retry.
+        state["state"] = "starting"
+        raise
+
+
 def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
     previous_version = state.get("kaggle_version")
-    if state.get("state") == "queued":
+    transitioned = state.get("state") == "queued"
+    if transitioned:
         state.update({"state": "starting", "attempt": int(state.get("attempt", 0)) + 1, "failure": None})
+    removed_legacy_field = state.pop("kaggle_version_before_push", None) is not None
+    try:
+        config_migrated = reconcile_delivery_config(state, config)
+    except TerminalDeliveryError as exc:
+        fail_job(github, release, state, str(exc))
+    if transitioned or removed_legacy_field or config_migrated:
         github.update_state(int(release["id"]), state)
-    state.pop("kaggle_version_before_push", None)
 
     latest = kaggle.latest()
     current_status = kaggle.status()
     current_version = latest_version(latest)
     previous_completed = (
         previous_version is not None
-        and current_version == int(previous_version)
+        and version_matches(latest, state)
         and current_status["status"] == "complete"
     )
     if previous_completed:
@@ -501,7 +598,7 @@ def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, 
             "kaggle_version": current_version, "kaggle_url": latest["url"],
             "started_at": state.get("started_at", isoformat()), "last_polled_at": None,
         })
-        github.update_state(int(release["id"]), state)
+        persist_running_state(github, release, state)
         print(f"Recovered Kaggle version {current_version} for {state['tag']}")
         return
     if current_status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
@@ -523,7 +620,7 @@ def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, 
         "kaggle_kernel": config.kernel_ref, "kaggle_version": pushed["version"],
         "kaggle_url": pushed["url"], "started_at": isoformat(), "last_polled_at": None,
     })
-    github.update_state(int(release["id"]), state)
+    persist_running_state(github, release, state)
     print(f"Pushed {state['tag']} as Kaggle version {pushed['version']}")
 
 
@@ -653,9 +750,10 @@ def create_model_manifest(
         },
         "tag": state["tag"],
         "git_sha": state["git_sha"],
+        "kaggle_kernel": state["kaggle_kernel"],
         "kaggle_version": state["kaggle_version"],
         "kaggle_url": state["kaggle_url"],
-        "rknn_target_platform": config.rknn_target_platform,
+        "rknn_target_platform": state["rknn_target_platform"],
         "preprocessing": payload["preprocessing"],
         "encoder_fingerprint": payload["encoder_fingerprint"],
         "architecture": {
@@ -786,6 +884,7 @@ def prepare_handoff(
     config: Config,
     handoff_dir: Path,
 ) -> None:
+    require_delivery_config(state, config)
     latest = kaggle.latest()
     if not version_matches(latest, state):
         raise TerminalDeliveryError(version_mismatch_message(latest, state))
@@ -805,8 +904,8 @@ def prepare_handoff(
         "schema": HANDOFF_SCHEMA,
         "release_id": int(release["id"]),
         "repository": config.repository,
-        "kaggle_kernel": config.kernel_ref,
-        "rknn_target_platform": config.rknn_target_platform,
+        "kaggle_kernel": state["kaggle_kernel"],
+        "rknn_target_platform": state["rknn_target_platform"],
         "state": dict(state),
     }
     (handoff_dir / "release-state.json").write_text(
@@ -826,6 +925,20 @@ def load_handoff(handoff_dir: Path) -> dict[str, Any]:
     state = metadata.get("state")
     if not isinstance(state, dict) or state.get("state") != "running":
         raise RuntimeError("Workflow handoff does not describe a running CD release")
+    for key in DELIVERY_CONFIG_KEYS:
+        outer = metadata.get(key)
+        if not isinstance(outer, str) or not outer:
+            raise RuntimeError(f"Workflow handoff is missing {key}")
+        if not state.get(key):
+            state[key] = outer
+        elif state.get(key) != outer:
+            raise RuntimeError(f"Workflow handoff {key} does not match release state")
+    missing_identity = [
+        key for key in RELEASE_IMMUTABLE_KEYS
+        if state.get(key) is None or state.get(key) == ""
+    ]
+    if missing_identity:
+        raise RuntimeError(f"Workflow handoff is missing release identity: {missing_identity}")
     return metadata
 
 
@@ -849,7 +962,9 @@ def convert_handoff(args: argparse.Namespace) -> None:
     assets = create_release_assets(
         args.handoff_dir / "output", args.output_dir / "assets", state, config
     )
-    shutil.copy2(args.handoff_dir / "release-state.json", args.output_dir / "release-state.json")
+    (args.output_dir / "release-state.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
     print(f"Prepared {len(assets)} Release assets for {state['tag']}")
 
 
@@ -874,6 +989,7 @@ def validate_release_assets(asset_dir: Path, metadata: Mapping[str, Any]) -> lis
         "schema": "signlang-model-release-v1",
         "tag": state["tag"],
         "git_sha": state["git_sha"],
+        "kaggle_kernel": state["kaggle_kernel"],
         "kaggle_version": state["kaggle_version"],
         "kaggle_url": state["kaggle_url"],
         "rknn_target_platform": metadata["rknn_target_platform"],
@@ -907,6 +1023,25 @@ def validate_release_assets(asset_dir: Path, metadata: Mapping[str, Any]) -> lis
     ]
 
 
+def migrate_legacy_release_target(
+    github: GitHubClient,
+    release: Mapping[str, Any],
+    current: dict[str, Any],
+    expected: Mapping[str, Any],
+) -> bool:
+    target_key = "rknn_target_platform"
+    if current.get(target_key) or not expected.get(target_key):
+        return False
+    stable_keys = tuple(
+        key for key in RELEASE_IMMUTABLE_KEYS if key != target_key
+    )
+    if any(current.get(key) != expected.get(key) for key in stable_keys):
+        return False
+    current[target_key] = expected[target_key]
+    github.update_state(int(release["id"]), current)
+    return True
+
+
 def publish_handoff(args: argparse.Namespace) -> None:
     metadata = load_handoff(args.handoff_dir)
     state = metadata["state"]
@@ -916,8 +1051,11 @@ def publish_handoff(args: argparse.Namespace) -> None:
     github = GitHubClient(config)
     release = github.get_release(int(metadata["release_id"]))
     current = state_for_release(release)
-    immutable_keys = ("tag", "git_sha", "kaggle_version", "kaggle_url")
-    mismatched = [key for key in immutable_keys if current.get(key) != state.get(key)]
+    migrate_legacy_release_target(github, release, current, state)
+    mismatched = [
+        key for key in RELEASE_IMMUTABLE_KEYS
+        if current.get(key) != state.get(key)
+    ]
     if mismatched or current.get("state") != "running":
         raise RuntimeError(
             f"Draft Release state changed after Kaggle handoff; mismatched fields: {mismatched}"
@@ -948,17 +1086,26 @@ def fail_handoff(args: argparse.Namespace) -> None:
     github = GitHubClient(config)
     release = github.get_release(int(metadata["release_id"]))
     if not release.get("draft"):
+        if release.get("tag_name") != state.get("tag"):
+            raise RuntimeError("Published Release tag does not match workflow handoff")
         print(f"Release {state['tag']} is already published; no failure state is needed")
         return
     current = state_for_release(release)
+    migrate_legacy_release_target(github, release, current, state)
+    mismatched = [
+        key for key in RELEASE_IMMUTABLE_KEYS
+        if current.get(key) != state.get(key)
+    ]
+    if mismatched:
+        raise RuntimeError(
+            f"Draft Release state changed before failure finalization: {mismatched}"
+        )
     if current.get("state") == "failed":
         print(f"Release {state['tag']} is already failed")
         return
-    immutable_keys = ("tag", "git_sha", "kaggle_version", "kaggle_url")
-    mismatched = [key for key in immutable_keys if current.get(key) != state.get(key)]
-    if mismatched or current.get("state") != "running":
+    if current.get("state") != "running":
         raise RuntimeError(
-            f"Draft Release state changed before failure finalization: {mismatched}"
+            f"Draft Release is {current.get('state')!r} before failure finalization"
         )
     detail = f"{args.phase} failed"
     if args.run_url:
@@ -977,6 +1124,12 @@ def poll_job(
     if state.get("state") == "starting":
         start_job(github, kaggle, release, state, config)
         return
+    try:
+        config_migrated = reconcile_delivery_config(state, config)
+    except TerminalDeliveryError as exc:
+        fail_job(github, release, state, str(exc))
+    if config_migrated:
+        github.update_state(int(release["id"]), state)
     latest = kaggle.latest()
     status = kaggle.status()
     state["last_polled_at"] = isoformat()
@@ -1008,6 +1161,13 @@ def enqueue(args: argparse.Namespace) -> None:
     config = Config.from_env(require_kaggle=False)
     release = GitHubClient(config).create_queue_release(args.tag, args.sha)
     print(f"Queued {args.tag} in draft release {release['id']}")
+
+
+def probe(_: argparse.Namespace) -> None:
+    config = Config.from_env(require_kaggle=False)
+    _, action = select_work(GitHubClient(config).list_releases())
+    print(f"has_work={'false' if action == 'idle' else 'true'}")
+    print(f"queue_action={action}")
 
 
 def retry(args: argparse.Namespace) -> None:
@@ -1053,6 +1213,8 @@ def parser() -> argparse.ArgumentParser:
     enqueue_parser.add_argument("--tag", required=True)
     enqueue_parser.add_argument("--sha", required=True)
     enqueue_parser.set_defaults(handler=enqueue)
+    probe_parser = commands.add_parser("probe")
+    probe_parser.set_defaults(handler=probe)
     tick_parser = commands.add_parser("tick")
     tick_parser.add_argument("--handoff-dir", type=Path, required=True)
     tick_parser.set_defaults(handler=tick)
