@@ -27,6 +27,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 
 STATE_SCHEMA = "signlang-kaggle-cd-v1"
+HANDOFF_SCHEMA = "signlang-kaggle-cd-handoff-v1"
 ACTIVE_STATES = {"starting", "running"}
 NOTEBOOK_PATH = "signlang_det_kaggle_training.ipynb"
 DEFAULT_KERNEL_SLUG = "signlang-det-training"
@@ -292,6 +293,9 @@ class GitHubClient:
             if len(batch) < 100:
                 return releases
             page += 1
+
+    def get_release(self, release_id: int) -> dict[str, Any]:
+        return self.request("GET", f"/releases/{release_id}")
 
     def create_queue_release(self, tag: str, git_sha: str) -> dict[str, Any]:
         if any(release.get("tag_name") == tag for release in self.list_releases()):
@@ -711,23 +715,106 @@ def create_release_assets(
     return assets
 
 
-def finalize_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
+def prepare_handoff(
+    kaggle: KaggleClient,
+    release: Mapping[str, Any],
+    state: Mapping[str, Any],
+    config: Config,
+    handoff_dir: Path,
+) -> None:
     latest = kaggle.latest()
     if not provenance_matches(latest, state) or int(latest["version"]) != int(state["kaggle_version"]):
         raise RuntimeError("Latest Kaggle notebook provenance/version does not match the queued tag")
-    with tempfile.TemporaryDirectory() as directory:
-        root = Path(directory)
-        output_dir, asset_dir = root / "output", root / "assets"
-        kaggle.download_output(output_dir)
-        assets = create_release_assets(output_dir, asset_dir, state, config)
-        github.upload_assets(str(state["tag"]), assets)
+    if handoff_dir.exists():
+        shutil.rmtree(handoff_dir)
+    output_dir = handoff_dir / "output"
+    kaggle.download_output(output_dir)
+    find_notebook_output_root(output_dir)
+    metadata = {
+        "schema": HANDOFF_SCHEMA,
+        "release_id": int(release["id"]),
+        "repository": config.repository,
+        "kaggle_kernel": config.kernel_ref,
+        "rknn_target_platform": config.rknn_target_platform,
+        "state": dict(state),
+    }
+    (handoff_dir / "release-state.json").write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
+    print(f"Prepared Kaggle output handoff for {state['tag']}")
+
+
+def load_handoff(handoff_dir: Path) -> dict[str, Any]:
+    path = handoff_dir / "release-state.json"
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read workflow handoff metadata from {path}: {exc}") from exc
+    if not isinstance(metadata, dict) or metadata.get("schema") != HANDOFF_SCHEMA:
+        raise RuntimeError(f"Unsupported workflow handoff metadata in {path}")
+    state = metadata.get("state")
+    if not isinstance(state, dict) or state.get("state") != "running":
+        raise RuntimeError("Workflow handoff does not describe a running CD release")
+    return metadata
+
+
+def convert_handoff(args: argparse.Namespace) -> None:
+    metadata = load_handoff(args.handoff_dir)
+    state = metadata["state"]
+    kernel = str(metadata["kaggle_kernel"])
+    if "/" not in kernel:
+        raise RuntimeError(f"Invalid Kaggle kernel reference in workflow handoff: {kernel!r}")
+    username, slug = kernel.split("/", 1)
+    config = Config(
+        repository=str(metadata["repository"]),
+        github_token="",
+        kaggle_username=username,
+        kernel_slug=slug,
+        kernel_private=True,
+        rknn_target_platform=str(metadata["rknn_target_platform"]),
+    )
+    if args.output_dir.exists():
+        shutil.rmtree(args.output_dir)
+    assets = create_release_assets(
+        args.handoff_dir / "output", args.output_dir / "assets", state, config
+    )
+    shutil.copy2(args.handoff_dir / "release-state.json", args.output_dir / "release-state.json")
+    print(f"Prepared {len(assets)} Release assets for {state['tag']}")
+
+
+def publish_handoff(args: argparse.Namespace) -> None:
+    metadata = load_handoff(args.handoff_dir)
+    state = metadata["state"]
+    config = Config.from_env(require_kaggle=False)
+    if metadata.get("repository") != config.repository:
+        raise RuntimeError("Workflow handoff repository does not match GITHUB_REPOSITORY")
+    github = GitHubClient(config)
+    release = github.get_release(int(metadata["release_id"]))
+    current = state_for_release(release)
+    immutable_keys = ("tag", "git_sha", "kaggle_version", "kaggle_url")
+    mismatched = [key for key in immutable_keys if current.get(key) != state.get(key)]
+    if mismatched or current.get("state") != "running":
+        raise RuntimeError(
+            f"Draft Release state changed after Kaggle handoff; mismatched fields: {mismatched}"
+        )
+    asset_dir = args.handoff_dir / "assets"
+    assets = [
+        *[asset_dir / name for name in RELEASE_MODEL_FILES],
+        asset_dir / "model-manifest.json",
+        asset_dir / NOTEBOOK_PATH,
+        asset_dir / "notebook-output.tar.gz",
+    ]
+    missing = [path.name for path in assets if not path.is_file()]
+    if missing:
+        raise RuntimeError(f"Converted workflow handoff is missing Release assets: {missing}")
+    github.upload_assets(str(state["tag"]), assets)
     body = (
         f"Kaggle training completed for `{state['tag']}`.\n\n"
         f"- Git commit: `{state['git_sha']}`\n"
-        f"- Kaggle kernel: `{config.kernel_ref}`\n"
+        f"- Kaggle kernel: `{metadata['kaggle_kernel']}`\n"
         f"- Kaggle version: `{state['kaggle_version']}`\n"
         f"- Kaggle URL: {state['kaggle_url']}\n"
-        f"- RKNN target platform: `{config.rknn_target_platform}`\n\n"
+        f"- RKNN target platform: `{metadata['rknn_target_platform']}`\n\n"
         "PT, ONNX, non-quantized RKNN, INT8 RKNN, the model manifest, the tagged notebook, "
         "and remaining notebook outputs are attached as seven Release assets.\n"
     )
@@ -735,7 +822,14 @@ def finalize_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[st
     print(f"Published GitHub release {state['tag']}")
 
 
-def poll_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
+def poll_job(
+    github: GitHubClient,
+    kaggle: KaggleClient,
+    release: Mapping[str, Any],
+    state: dict[str, Any],
+    config: Config,
+    handoff_dir: Path,
+) -> None:
     if state.get("state") == "starting":
         start_job(github, kaggle, release, state, config)
         return
@@ -755,7 +849,7 @@ def poll_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, A
         github.update_state(int(release["id"]), state)
         print(f"Kaggle version {state['kaggle_version']} is {status['status']}")
     elif status["status"] == "complete":
-        finalize_job(github, kaggle, release, state, config)
+        prepare_handoff(kaggle, release, state, config, handoff_dir)
     elif status["status"] in {"error", "cancel_acknowledged"}:
         message = status["failure_message"] or f"Kaggle status: {status['status']}"
         mark_failed(github, release, state, message)
@@ -796,7 +890,7 @@ def tick(args: argparse.Namespace) -> None:
         if action == "start":
             start_job(github, kaggle, release, state, config)
         else:
-            poll_job(github, kaggle, release, state, config)
+            poll_job(github, kaggle, release, state, config, args.handoff_dir)
     except Exception as exc:
         # External/transient failures keep active jobs recoverable. Starting failures
         # before a Kaggle version exists are terminal and release the queue.
@@ -813,10 +907,18 @@ def parser() -> argparse.ArgumentParser:
     enqueue_parser.add_argument("--sha", required=True)
     enqueue_parser.set_defaults(handler=enqueue)
     tick_parser = commands.add_parser("tick")
+    tick_parser.add_argument("--handoff-dir", type=Path, required=True)
     tick_parser.set_defaults(handler=tick)
     retry_parser = commands.add_parser("retry")
     retry_parser.add_argument("--tag", required=True)
     retry_parser.set_defaults(handler=retry)
+    convert_parser = commands.add_parser("convert-handoff")
+    convert_parser.add_argument("--handoff-dir", type=Path, required=True)
+    convert_parser.add_argument("--output-dir", type=Path, required=True)
+    convert_parser.set_defaults(handler=convert_handoff)
+    publish_parser = commands.add_parser("publish-handoff")
+    publish_parser.add_argument("--handoff-dir", type=Path, required=True)
+    publish_parser.set_defaults(handler=publish_handoff)
     return root
 
 
