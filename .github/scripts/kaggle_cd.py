@@ -12,6 +12,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -51,6 +52,15 @@ RELEASE_MODEL_FILES = (
     "signlang_det_encoder.rknn",
     "signlang_det_encoder.int8.rknn",
 )
+RELEASE_ASSET_FILES = (
+    *RELEASE_MODEL_FILES,
+    NOTEBOOK_PATH,
+    "notebook-output.tar.gz",
+)
+
+
+class TerminalDeliveryError(RuntimeError):
+    """A deterministic delivery failure that requires an explicit retry."""
 
 
 def utcnow() -> datetime:
@@ -193,19 +203,6 @@ def build_kernel_metadata(username: str, slug: str, private: bool) -> dict[str, 
         "kernel_sources": [TARGET_KERNEL_SOURCE],
         "model_sources": [],
     }
-
-
-def inject_provenance(notebook: Mapping[str, Any], tag: str, git_sha: str, repository: str) -> dict[str, Any]:
-    output = copy.deepcopy(dict(notebook))
-    metadata = output.setdefault("metadata", {})
-    metadata.pop("kaggle", None)
-    metadata.pop("accelerator", None)
-    metadata["signlang_cd"] = {
-        "release_tag": tag,
-        "git_sha": git_sha,
-        "repository": repository,
-    }
-    return output
 
 
 def sha256_file(path: Path) -> str:
@@ -380,13 +377,8 @@ class KaggleClient:
             if self._kernel_missing(exc):
                 return None
             raise
-        try:
-            notebook = json.loads(response.blob.source)
-        except (TypeError, json.JSONDecodeError):
-            notebook = {}
         return {
             "version": int(response.metadata.current_version_number),
-            "provenance": notebook.get("metadata", {}).get("signlang_cd", {}),
             "url": f"https://www.kaggle.com/code/{self.config.kernel_ref}",
         }
 
@@ -417,7 +409,17 @@ class KaggleClient:
 
     def download_output(self, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
-        self.api.kernels_output(self.config.kernel_ref, str(destination), force=True, quiet=False)
+        file_pattern = "^(?:" + "|".join(map(re.escape, NOTEBOOK_OUTPUT_FILES)) + ")$"
+        self.api.kernels_output(
+            self.config.kernel_ref,
+            str(destination),
+            file_pattern=file_pattern,
+            force=True,
+            quiet=False,
+        )
+        kernel_log = destination / f"{self.config.kernel_slug}.log"
+        if kernel_log.is_file() or kernel_log.is_symlink():
+            kernel_log.unlink()
 
 
 def state_for_release(release: Mapping[str, Any]) -> dict[str, Any]:
@@ -433,19 +435,30 @@ def stage_upload(state: Mapping[str, Any], config: Config, folder: Path) -> None
     if resolved.strip() != git_sha:
         raise RuntimeError(f"Tag {tag} resolves to {resolved.strip()}, expected {git_sha}")
     notebook_text = subprocess.check_output(["git", "show", f"{git_sha}:{NOTEBOOK_PATH}"], text=True)
-    notebook = json.loads(notebook_text)
-    injected = inject_provenance(notebook, tag, git_sha, config.repository)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / NOTEBOOK_PATH).write_text(json.dumps(injected, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    (folder / NOTEBOOK_PATH).write_text(notebook_text, encoding="utf-8")
     metadata = build_kernel_metadata(config.kaggle_username, config.kernel_slug, config.kernel_private)
     (folder / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def provenance_matches(latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]) -> bool:
-    if latest is None:
-        return False
-    provenance = latest.get("provenance") or {}
-    return provenance.get("release_tag") == state.get("tag") and provenance.get("git_sha") == state.get("git_sha")
+def latest_version(latest: Optional[Mapping[str, Any]]) -> Optional[int]:
+    if latest is None or latest.get("version") is None:
+        return None
+    return int(latest["version"])
+
+
+def version_matches(latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]) -> bool:
+    expected = state.get("kaggle_version")
+    return expected is not None and latest_version(latest) == int(expected)
+
+
+def version_mismatch_message(
+    latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]
+) -> str:
+    return (
+        f"Kaggle latest version {latest_version(latest)!r} does not match "
+        f"expected version {state.get('kaggle_version')!r} for tag {state.get('tag')!r}"
+    )
 
 
 def mark_failed(github: GitHubClient, release: Mapping[str, Any], state: dict[str, Any], message: str) -> None:
@@ -454,25 +467,39 @@ def mark_failed(github: GitHubClient, release: Mapping[str, Any], state: dict[st
     print(f"Kaggle CD failed for {state['tag']}: {message}", file=sys.stderr)
 
 
+def fail_job(
+    github: GitHubClient,
+    release: Mapping[str, Any],
+    state: dict[str, Any],
+    message: str,
+) -> None:
+    mark_failed(github, release, state, message)
+    raise RuntimeError(message)
+
+
 def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
     previous_version = state.get("kaggle_version")
     if state.get("state") == "queued":
         state.update({"state": "starting", "attempt": int(state.get("attempt", 0)) + 1, "failure": None})
         github.update_state(int(release["id"]), state)
+    state.pop("kaggle_version_before_push", None)
 
     latest = kaggle.latest()
     current_status = kaggle.status()
-    recoverable = provenance_matches(latest, state) and (
-        previous_version is None or int(latest["version"]) != int(previous_version)
+    current_version = latest_version(latest)
+    previous_completed = (
+        previous_version is not None
+        and current_version == int(previous_version)
+        and current_status["status"] == "complete"
     )
-    if recoverable:
+    if previous_completed:
         state.update({
             "state": "running", "kaggle_kernel": config.kernel_ref,
-            "kaggle_version": latest["version"], "kaggle_url": latest["url"],
+            "kaggle_version": current_version, "kaggle_url": latest["url"],
             "started_at": state.get("started_at", isoformat()), "last_polled_at": None,
         })
         github.update_state(int(release["id"]), state)
-        print(f"Recovered Kaggle version {latest['version']} for {state['tag']}")
+        print(f"Recovered Kaggle version {current_version} for {state['tag']}")
         return
     if current_status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
         state.update({
@@ -503,7 +530,7 @@ def validate_notebook_outputs(output_root: Path) -> None:
     if actual != expected:
         missing = sorted(str(path) for path in expected - actual)
         unexpected = sorted(str(path) for path in actual - expected)
-        raise RuntimeError(
+        raise TerminalDeliveryError(
             f"Kaggle notebook output allowlist mismatch: missing={missing}, unexpected={unexpected}"
         )
 
@@ -511,7 +538,7 @@ def validate_notebook_outputs(output_root: Path) -> None:
 def find_notebook_output_root(download_dir: Path) -> Path:
     matches = [path.parent for path in download_dir.rglob("signlang_det_encoder.pt")]
     if len(matches) != 1:
-        raise RuntimeError(f"Expected one notebook output root, found {len(matches)}")
+        raise TerminalDeliveryError(f"Expected one notebook output root, found {len(matches)}")
     validate_notebook_outputs(matches[0])
     return matches[0]
 
@@ -546,10 +573,11 @@ def create_model_manifest(
     asset_dir: Path,
     state: Mapping[str, Any],
     config: Config,
+    converter_sha256: str,
 ) -> Path:
     import torch
 
-    payload = torch.load(pt_path, map_location="cpu", weights_only=False)
+    payload = torch.load(pt_path, map_location="cpu", weights_only=True)
     required = {
         "preprocessing",
         "encoder_fingerprint",
@@ -630,6 +658,8 @@ def create_model_manifest(
         "architecture": {
             "name": "HandEncoder",
             "implementation": ".github/scripts/convert_models.py",
+            "implementation_git_sha": state["git_sha"],
+            "implementation_sha256": converter_sha256,
             "config": payload["model_config"],
         },
         "artifacts": {
@@ -664,7 +694,9 @@ def create_model_manifest(
         "models": models,
         "integrity": {
             "algorithm": "sha256",
-            "files": {name: metadata["sha256"] for name, metadata in models.items()},
+            "files": {
+                name: sha256_file(asset_dir / name) for name in RELEASE_ASSET_FILES
+            },
         },
     }
     path = asset_dir / "model-manifest.json"
@@ -691,17 +723,46 @@ def create_release_assets(
     notebook_asset = asset_dir / NOTEBOOK_PATH
     notebook_asset.write_text(notebook_text, encoding="utf-8")
 
-    converter = Path(__file__).with_name("convert_models.py")
+    converter_source = subprocess.check_output(
+        ["git", "show", f"{state['git_sha']}:.github/scripts/convert_models.py"]
+    )
+    current_converter = Path(__file__).with_name("convert_models.py")
+    current_converter_sha256 = sha256_file(current_converter)
     run([
         sys.executable,
-        str(converter),
+        str(current_converter),
         "--pt", str(pt_asset),
         "--calibration", str(output_root / "int8_calibration.tar.gz"),
         "--output-dir", str(asset_dir),
         "--target-platform", config.rknn_target_platform,
+        "--validate-only",
     ])
+    with tempfile.TemporaryDirectory() as directory:
+        converter = Path(directory) / "convert_models.py"
+        converter.write_bytes(converter_source)
+        converter_sha256 = sha256_file(converter)
+        run([
+            sys.executable,
+            str(converter),
+            "--pt", str(pt_asset),
+            "--calibration", str(output_root / "int8_calibration.tar.gz"),
+            "--output-dir", str(asset_dir),
+            "--target-platform", config.rknn_target_platform,
+        ])
+    if converter_sha256 != current_converter_sha256:
+        run([
+            sys.executable,
+            str(current_converter),
+            "--pt", str(pt_asset),
+            "--calibration", str(output_root / "int8_calibration.tar.gz"),
+            "--output-dir", str(asset_dir),
+            "--target-platform", config.rknn_target_platform,
+            "--verify-rknn-only",
+        ])
 
-    manifest_asset = create_model_manifest(pt_asset, asset_dir, state, config)
+    manifest_asset = create_model_manifest(
+        pt_asset, asset_dir, state, config, converter_sha256
+    )
 
     assets = [
         *[asset_dir / name for name in RELEASE_MODEL_FILES],
@@ -723,13 +784,20 @@ def prepare_handoff(
     handoff_dir: Path,
 ) -> None:
     latest = kaggle.latest()
-    if not provenance_matches(latest, state) or int(latest["version"]) != int(state["kaggle_version"]):
-        raise RuntimeError("Latest Kaggle notebook provenance/version does not match the queued tag")
+    if not version_matches(latest, state):
+        raise TerminalDeliveryError(version_mismatch_message(latest, state))
     if handoff_dir.exists():
         shutil.rmtree(handoff_dir)
     output_dir = handoff_dir / "output"
     kaggle.download_output(output_dir)
     find_notebook_output_root(output_dir)
+    downloaded_version = kaggle.latest()
+    if not version_matches(downloaded_version, state):
+        shutil.rmtree(handoff_dir)
+        raise TerminalDeliveryError(
+            "Kaggle version changed while downloading output: "
+            + version_mismatch_message(downloaded_version, state)
+        )
     metadata = {
         "schema": HANDOFF_SCHEMA,
         "release_id": int(release["id"]),
@@ -782,6 +850,60 @@ def convert_handoff(args: argparse.Namespace) -> None:
     print(f"Prepared {len(assets)} Release assets for {state['tag']}")
 
 
+def validate_release_assets(asset_dir: Path, metadata: Mapping[str, Any]) -> list[Path]:
+    expected_names = {*RELEASE_ASSET_FILES, "model-manifest.json"}
+    actual_names = {
+        str(path.relative_to(asset_dir)) for path in asset_dir.rglob("*") if path.is_file()
+    }
+    if actual_names != expected_names:
+        raise RuntimeError(
+            "Converted Release asset set is invalid: "
+            f"missing={sorted(expected_names - actual_names)}, "
+            f"unexpected={sorted(actual_names - expected_names)}"
+        )
+    manifest_path = asset_dir / "model-manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read model manifest: {exc}") from exc
+    state = metadata["state"]
+    expected_manifest = {
+        "schema": "signlang-model-release-v1",
+        "tag": state["tag"],
+        "git_sha": state["git_sha"],
+        "kaggle_version": state["kaggle_version"],
+        "kaggle_url": state["kaggle_url"],
+        "rknn_target_platform": metadata["rknn_target_platform"],
+    }
+    mismatched = [
+        key for key, value in expected_manifest.items() if manifest.get(key) != value
+    ]
+    if mismatched:
+        raise RuntimeError(f"Model manifest handoff mismatch: {mismatched}")
+    integrity = manifest.get("integrity") or {}
+    if integrity.get("algorithm") != "sha256":
+        raise RuntimeError("Model manifest does not use SHA-256 integrity metadata")
+    recorded_hashes = integrity.get("files") or {}
+    for name in RELEASE_ASSET_FILES:
+        actual_hash = sha256_file(asset_dir / name)
+        if recorded_hashes.get(name) != actual_hash:
+            raise RuntimeError(f"Release asset SHA-256 mismatch: {name}")
+    models = manifest.get("models") or {}
+    for name in RELEASE_MODEL_FILES:
+        model = models.get(name) or {}
+        path = asset_dir / name
+        if model.get("bytes") != path.stat().st_size:
+            raise RuntimeError(f"Release model size mismatch: {name}")
+        if model.get("sha256") != sha256_file(path):
+            raise RuntimeError(f"Release model manifest hash mismatch: {name}")
+    return [
+        *[asset_dir / name for name in RELEASE_MODEL_FILES],
+        manifest_path,
+        asset_dir / NOTEBOOK_PATH,
+        asset_dir / "notebook-output.tar.gz",
+    ]
+
+
 def publish_handoff(args: argparse.Namespace) -> None:
     metadata = load_handoff(args.handoff_dir)
     state = metadata["state"]
@@ -798,15 +920,7 @@ def publish_handoff(args: argparse.Namespace) -> None:
             f"Draft Release state changed after Kaggle handoff; mismatched fields: {mismatched}"
         )
     asset_dir = args.handoff_dir / "assets"
-    assets = [
-        *[asset_dir / name for name in RELEASE_MODEL_FILES],
-        asset_dir / "model-manifest.json",
-        asset_dir / NOTEBOOK_PATH,
-        asset_dir / "notebook-output.tar.gz",
-    ]
-    missing = [path.name for path in assets if not path.is_file()]
-    if missing:
-        raise RuntimeError(f"Converted workflow handoff is missing Release assets: {missing}")
+    assets = validate_release_assets(asset_dir, metadata)
     github.upload_assets(str(state["tag"]), assets)
     body = (
         f"Kaggle training completed for `{state['tag']}`.\n\n"
@@ -820,6 +934,33 @@ def publish_handoff(args: argparse.Namespace) -> None:
     )
     github.publish(int(release["id"]), str(state["tag"]), body)
     print(f"Published GitHub release {state['tag']}")
+
+
+def fail_handoff(args: argparse.Namespace) -> None:
+    metadata = load_handoff(args.handoff_dir)
+    state = metadata["state"]
+    config = Config.from_env(require_kaggle=False)
+    if metadata.get("repository") != config.repository:
+        raise RuntimeError("Workflow handoff repository does not match GITHUB_REPOSITORY")
+    github = GitHubClient(config)
+    release = github.get_release(int(metadata["release_id"]))
+    if not release.get("draft"):
+        print(f"Release {state['tag']} is already published; no failure state is needed")
+        return
+    current = state_for_release(release)
+    if current.get("state") == "failed":
+        print(f"Release {state['tag']} is already failed")
+        return
+    immutable_keys = ("tag", "git_sha", "kaggle_version", "kaggle_url")
+    mismatched = [key for key in immutable_keys if current.get(key) != state.get(key)]
+    if mismatched or current.get("state") != "running":
+        raise RuntimeError(
+            f"Draft Release state changed before failure finalization: {mismatched}"
+        )
+    detail = f"{args.phase} failed"
+    if args.run_url:
+        detail += f"; inspect {args.run_url}"
+    mark_failed(github, release, current, detail)
 
 
 def poll_job(
@@ -836,23 +977,26 @@ def poll_job(
     latest = kaggle.latest()
     status = kaggle.status()
     state["last_polled_at"] = isoformat()
-    if not provenance_matches(latest, state) or int(latest["version"]) != int(state["kaggle_version"]):
+    if not version_matches(latest, state):
+        message = version_mismatch_message(latest, state)
         if status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
             state["external_status"] = status["status"]
             github.update_state(int(release["id"]), state)
-            print("A different Kaggle version is active; waiting to preserve serialization")
+            print(f"{message}; waiting for the active version to finish")
             return
-        mark_failed(github, release, state, "Latest Kaggle version no longer matches this tag")
-        return
+        fail_job(github, release, state, message)
     if status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
         state["kaggle_status"] = status["status"]
         github.update_state(int(release["id"]), state)
         print(f"Kaggle version {state['kaggle_version']} is {status['status']}")
     elif status["status"] == "complete":
-        prepare_handoff(kaggle, release, state, config, handoff_dir)
+        try:
+            prepare_handoff(kaggle, release, state, config, handoff_dir)
+        except TerminalDeliveryError as exc:
+            fail_job(github, release, state, str(exc))
     elif status["status"] in {"error", "cancel_acknowledged"}:
         message = status["failure_message"] or f"Kaggle status: {status['status']}"
-        mark_failed(github, release, state, message)
+        fail_job(github, release, state, message)
     else:
         raise RuntimeError(f"Unknown Kaggle status: {status['status']}")
 
@@ -874,6 +1018,7 @@ def retry(args: argparse.Namespace) -> None:
     if state.get("state") != "failed":
         raise RuntimeError(f"Only failed jobs can be retried; {args.tag} is {state.get('state')}")
     state.update({"state": "queued", "failure": None, "queued_at": isoformat(), "last_polled_at": None})
+    state.pop("kaggle_version_before_push", None)
     github.update_state(int(release["id"]), state)
     print(f"Requeued {args.tag}")
 
@@ -892,9 +1037,8 @@ def tick(args: argparse.Namespace) -> None:
         else:
             poll_job(github, kaggle, release, state, config, args.handoff_dir)
     except Exception as exc:
-        # External/transient failures keep active jobs recoverable. Starting failures
-        # before a Kaggle version exists are terminal and release the queue.
-        if state.get("state") == "starting" and not state.get("kaggle_version"):
+        # Running API failures remain recoverable; startup failures release the queue.
+        if state.get("state") == "starting":
             mark_failed(github, release, state, f"{type(exc).__name__}: {exc}")
         raise
 
@@ -919,6 +1063,11 @@ def parser() -> argparse.ArgumentParser:
     publish_parser = commands.add_parser("publish-handoff")
     publish_parser.add_argument("--handoff-dir", type=Path, required=True)
     publish_parser.set_defaults(handler=publish_handoff)
+    fail_parser = commands.add_parser("fail-handoff")
+    fail_parser.add_argument("--handoff-dir", type=Path, required=True)
+    fail_parser.add_argument("--phase", required=True)
+    fail_parser.add_argument("--run-url")
+    fail_parser.set_defaults(handler=fail_handoff)
     return root
 
 

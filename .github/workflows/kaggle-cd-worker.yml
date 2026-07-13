@@ -10,8 +10,7 @@ on:
         required: false
         type: string
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: kaggle-cd-worker
@@ -22,20 +21,23 @@ jobs:
     if: ${{ inputs.retry_tag != '' }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
       - name: Requeue requested failed tag
         env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           RETRY_TAG: ${{ inputs.retry_tag }}
         run: python .github/scripts/kaggle_cd.py retry --tag "$RETRY_TAG"
 
@@ -46,21 +48,21 @@ jobs:
     timeout-minutes: 30
     outputs:
       ready: ${{ steps.tick.outputs.ready }}
+    permissions:
+      contents: write
     env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
-      KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
       KAGGLE_KERNEL_SLUG: ${{ vars.KAGGLE_KERNEL_SLUG || 'signlang-det-training' }}
       KAGGLE_KERNEL_PRIVATE: ${{ vars.KAGGLE_KERNEL_PRIVATE || 'true' }}
       RKNN_TARGET_PLATFORM: ${{ vars.RKNN_TARGET_PLATFORM || 'rk3588' }}
     steps:
       - name: Check out repository and tags
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python 3.11
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.11"
 
@@ -74,6 +76,9 @@ jobs:
       - name: Advance the Kaggle state machine once
         id: tick
         env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          KAGGLE_API_TOKEN: ${{ secrets.KAGGLE_API_TOKEN }}
           HANDOFF_DIR: ${{ runner.temp }}/kaggle-handoff
         run: |
           python .github/scripts/kaggle_cd.py tick --handoff-dir "$HANDOFF_DIR"
@@ -85,33 +90,50 @@ jobs:
 
       - name: Upload completed Kaggle output
         if: ${{ steps.tick.outputs.ready == 'true' }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: kaggle-output-${{ github.run_id }}
           path: ${{ runner.temp }}/kaggle-handoff
           if-no-files-found: error
-          retention-days: 1
+          overwrite: true
+          retention-days: 7
+
+      - name: Mark handoff artifact failure
+        if: ${{ failure() && steps.tick.outputs.ready == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HANDOFF_DIR: ${{ runner.temp }}/kaggle-handoff
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >-
+          python .github/scripts/kaggle_cd.py fail-handoff
+          --handoff-dir "$HANDOFF_DIR"
+          --phase "Kaggle output artifact upload"
+          --run-url "$RUN_URL"
 
   convert:
     needs: kaggle
     if: ${{ needs.kaggle.outputs.ready == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    permissions:
+      contents: read
     steps:
       - name: Check out repository and tags
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python 3.10
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.10"
 
       - name: Install pinned model conversion environment
         run: >-
           python -m pip install --disable-pip-version-check
-          "setuptools<81"
+          "setuptools==79.0.1"
           "numpy==1.26.4"
           "torch==2.4.0"
           "onnx==1.16.1"
@@ -119,7 +141,7 @@ jobs:
           "rknn-toolkit2==2.3.2"
 
       - name: Download completed Kaggle output
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: kaggle-output-${{ github.run_id }}
           path: ${{ runner.temp }}/kaggle-handoff
@@ -134,38 +156,87 @@ jobs:
           --output-dir "$CONVERTED_DIR"
 
       - name: Upload converted Release assets
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: converted-release-${{ github.run_id }}
           path: ${{ runner.temp }}/converted-release
           if-no-files-found: error
-          retention-days: 1
+          overwrite: true
+          retention-days: 7
 
   publish:
     needs: convert
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GITHUB_REPOSITORY: ${{ github.repository }}
+    permissions:
+      contents: write
     steps:
       - name: Check out repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: "3.12"
 
       - name: Download converted Release assets
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
         with:
           name: converted-release-${{ github.run_id }}
           path: ${{ runner.temp }}/converted-release
 
       - name: Upload assets and publish Release
         env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           HANDOFF_DIR: ${{ runner.temp }}/converted-release
         run: >-
           python .github/scripts/kaggle_cd.py publish-handoff
           --handoff-dir "$HANDOFF_DIR"
+
+  finalize-failure:
+    needs: [kaggle, convert, publish]
+    if: >-
+      ${{ always() && needs.kaggle.outputs.ready == 'true' &&
+          (needs.convert.result == 'failure' || needs.convert.result == 'cancelled' ||
+           needs.publish.result == 'failure' || needs.publish.result == 'cancelled') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.12"
+
+      - name: Download Kaggle handoff metadata
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: kaggle-output-${{ github.run_id }}
+          path: ${{ runner.temp }}/kaggle-handoff
+
+      - name: Mark delivery as failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HANDOFF_DIR: ${{ runner.temp }}/kaggle-handoff
+          CONVERT_RESULT: ${{ needs.convert.result }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          if [[ "$CONVERT_RESULT" == "failure" || "$CONVERT_RESULT" == "cancelled" ]]; then
+            phase="Model conversion"
+          else
+            phase="Release publication"
+          fi
+          python .github/scripts/kaggle_cd.py fail-handoff \
+            --handoff-dir "$HANDOFF_DIR" \
+            --phase "$phase" \
+            --run-url "$RUN_URL"

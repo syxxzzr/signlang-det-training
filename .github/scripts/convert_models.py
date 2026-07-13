@@ -27,6 +27,11 @@ PREPROCESSING_CONTRACT = "hand168-temporal"
 FEATURE_SHAPE = (1, 64, 168)
 LENGTH_SHAPE = (1,)
 OUTPUT_SHAPE = (1, 64, 128)
+CALIBRATION_MAX_SAMPLES = 100
+CALIBRATION_MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
+CALIBRATION_MAX_MEMBER_BYTES = 1024 * 1024
+CALIBRATION_MAX_EXTRACTED_BYTES = 16 * 1024 * 1024
+CALIBRATION_MAX_MEMBERS = CALIBRATION_MAX_SAMPLES * 2 + 2
 
 
 class TemporalBlock(nn.Module):
@@ -109,8 +114,10 @@ def encoder_fingerprint(state_dict: Mapping[str, torch.Tensor]) -> str:
     return digest.hexdigest()
 
 
-def load_encoder(path: Path) -> HandEncoder:
-    payload = torch.load(path, map_location="cpu", weights_only=False)
+def load_safe_checkpoint(path: Path) -> Mapping[str, object]:
+    payload = torch.load(path, map_location="cpu", weights_only=True)
+    if not isinstance(payload, Mapping):
+        raise ValueError("PT export payload must be a mapping")
     required = {
         "schema",
         "preprocessing",
@@ -121,19 +128,31 @@ def load_encoder(path: Path) -> HandEncoder:
     missing = sorted(required - payload.keys())
     if missing:
         raise ValueError(f"PT export is missing fields: {missing}")
+    encoder = payload["encoder"]
+    if not isinstance(encoder, Mapping) or not encoder:
+        raise ValueError("PT encoder state must be a non-empty mapping")
+    if not all(isinstance(name, str) and isinstance(tensor, torch.Tensor) for name, tensor in encoder.items()):
+        raise ValueError("PT encoder state must contain only named tensors")
+    actual = encoder_fingerprint(encoder)
+    if actual != payload["encoder_fingerprint"]:
+        raise ValueError("PT encoder fingerprint does not match its weights")
+    return payload
+
+
+def load_encoder(path: Path) -> HandEncoder:
+    payload = load_safe_checkpoint(path)
     if payload["schema"] != CHECKPOINT_SCHEMA:
         raise ValueError(f"Unsupported PT schema: {payload['schema']}")
     if payload["preprocessing"] != PREPROCESSING_CONTRACT:
         raise ValueError(f"Unsupported preprocessing contract: {payload['preprocessing']}")
-    actual = encoder_fingerprint(payload["encoder"])
-    if actual != payload["encoder_fingerprint"]:
-        raise ValueError("PT encoder fingerprint does not match its weights")
     model = HandEncoder(**payload["model_config"])
     model.load_state_dict(payload["encoder"], strict=True)
     return model.eval()
 
 
-def export_onnx(pt_path: Path, onnx_path: Path) -> None:
+def export_onnx(
+    pt_path: Path, onnx_path: Path
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     model = load_encoder(pt_path)
     generator = torch.Generator().manual_seed(20260712)
     features = torch.randn(FEATURE_SHAPE, generator=generator, dtype=torch.float32)
@@ -173,18 +192,47 @@ def export_onnx(pt_path: Path, onnx_path: Path) -> None:
     if tuple(actual.shape) != OUTPUT_SHAPE:
         raise RuntimeError(f"ONNX output shape is {tuple(actual.shape)}, expected {OUTPUT_SHAPE}")
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
+    return features.numpy(), lengths.numpy(), actual
 
 
 def _safe_members(bundle: tarfile.TarFile) -> list[tarfile.TarInfo]:
-    members = bundle.getmembers()
-    for member in members:
+    members, seen, total_size = [], set(), 0
+    for member in bundle:
+        if len(members) >= CALIBRATION_MAX_MEMBERS:
+            raise ValueError(
+                f"Calibration archive contains more than {CALIBRATION_MAX_MEMBERS} members"
+            )
         path = PurePosixPath(member.name)
-        if path.is_absolute() or ".." in path.parts or member.issym() or member.islnk():
+        allowed_name = (
+            path in {PurePosixPath("dataset.txt"), PurePosixPath("selection.csv")}
+            or (
+                len(path.parts) == 2
+                and path.parts[0] == "samples"
+                and path.suffix == ".npy"
+                and path.name.startswith(("features_", "lengths_"))
+            )
+        )
+        if (
+            path.is_absolute()
+            or ".." in path.parts
+            or not member.isfile()
+            or not allowed_name
+            or path in seen
+        ):
             raise ValueError(f"Calibration archive contains an unsafe member: {member.name}")
+        if member.size < 0 or member.size > CALIBRATION_MAX_MEMBER_BYTES:
+            raise ValueError(f"Calibration archive member is too large: {member.name}")
+        seen.add(path)
+        total_size += member.size
+        members.append(member)
+    if total_size > CALIBRATION_MAX_EXTRACTED_BYTES:
+        raise ValueError("Calibration archive expands beyond the allowed size")
     return members
 
 
 def prepare_calibration_dataset(archive: Path, destination: Path) -> Path:
+    if archive.stat().st_size > CALIBRATION_MAX_ARCHIVE_BYTES:
+        raise ValueError("Calibration archive is larger than the allowed compressed size")
     if destination.exists():
         shutil.rmtree(destination)
     destination.mkdir(parents=True)
@@ -194,8 +242,10 @@ def prepare_calibration_dataset(archive: Path, destination: Path) -> Path:
     source_list = destination / "dataset.txt"
     if not source_list.is_file():
         raise ValueError("Calibration archive does not contain dataset.txt")
-    resolved_lines = []
+    resolved_lines, referenced = [], {Path("dataset.txt"), Path("selection.csv")}
     for line_number, line in enumerate(source_list.read_text(encoding="utf-8").splitlines(), 1):
+        if line_number > CALIBRATION_MAX_SAMPLES:
+            raise ValueError("Calibration dataset contains too many samples")
         values = line.split()
         if len(values) != 2:
             raise ValueError(f"Calibration dataset line {line_number} must contain two inputs")
@@ -204,17 +254,29 @@ def prepare_calibration_dataset(archive: Path, destination: Path) -> Path:
             raise ValueError(f"Calibration dataset line {line_number} contains an unsafe path")
         if not all(path.is_file() for path in paths):
             raise ValueError(f"Calibration dataset line {line_number} references a missing input")
-        features = np.load(paths[0], allow_pickle=False)
-        lengths = np.load(paths[1], allow_pickle=False)
+        features = np.load(paths[0], allow_pickle=False, mmap_mode="r")
+        lengths = np.load(paths[1], allow_pickle=False, mmap_mode="r")
         if features.dtype != np.float32 or tuple(features.shape) != FEATURE_SHAPE:
             raise ValueError(f"Calibration features on line {line_number} have an invalid contract")
         if lengths.dtype != np.int32 or tuple(lengths.shape) != LENGTH_SHAPE:
             raise ValueError(f"Calibration lengths on line {line_number} have an invalid contract")
         if not 1 <= int(lengths[0]) <= FEATURE_SHAPE[1]:
             raise ValueError(f"Calibration length on line {line_number} is out of range")
+        if not np.isfinite(features).all():
+            raise ValueError(f"Calibration features on line {line_number} are not finite")
+        referenced.update(Path(value) for value in values)
         resolved_lines.append(" ".join(str(path) for path in paths))
     if not resolved_lines:
         raise ValueError("Calibration dataset is empty")
+    actual_files = {
+        path.relative_to(destination) for path in destination.rglob("*") if path.is_file()
+    }
+    if actual_files != referenced:
+        raise ValueError(
+            "Calibration archive file set does not match dataset.txt: "
+            f"missing={sorted(map(str, referenced - actual_files))}, "
+            f"unexpected={sorted(map(str, actual_files - referenced))}"
+        )
     resolved = destination / "dataset.resolved.txt"
     resolved.write_text("\n".join(resolved_lines) + "\n", encoding="utf-8")
     return resolved
@@ -225,11 +287,47 @@ def _require_success(result: object, operation: str) -> None:
         raise RuntimeError(f"RKNN {operation} failed with code {result}")
 
 
+def _validate_rknn_outputs(
+    model_name: str,
+    outputs: object,
+    test_inputs: Sequence[np.ndarray],
+    expected: np.ndarray,
+    quantized: bool,
+) -> None:
+    if not isinstance(outputs, (list, tuple)):
+        raise RuntimeError(
+            f"RKNN inference returned {type(outputs).__name__}, expected a list of outputs"
+        )
+    if len(outputs) != 1:
+        output_count = len(outputs)
+        raise RuntimeError(f"RKNN inference returned {output_count} outputs, expected 1")
+    actual = np.asarray(outputs[0])
+    if tuple(actual.shape) != OUTPUT_SHAPE:
+        raise RuntimeError(f"RKNN output shape is {tuple(actual.shape)}, expected {OUTPUT_SHAPE}")
+    if not np.isfinite(actual).all():
+        raise RuntimeError("RKNN inference produced non-finite values")
+    valid_steps = int(test_inputs[1][0])
+    expected_valid = expected[:, :valid_steps].astype(np.float64, copy=False).reshape(-1)
+    actual_valid = actual[:, :valid_steps].astype(np.float64, copy=False).reshape(-1)
+    denominator = np.linalg.norm(expected_valid) * np.linalg.norm(actual_valid)
+    cosine = float(np.dot(expected_valid, actual_valid) / denominator) if denominator else 0.0
+    if not quantized:
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-4)
+    elif cosine < 0.95:
+        raise RuntimeError(f"INT8 RKNN cosine similarity is {cosine:.6f}, expected >= 0.95")
+    print(
+        f"Validated {model_name} with RKNN simulator: "
+        f"dtype={actual.dtype}, cosine={cosine:.6f}"
+    )
+
+
 def _build_one_rknn(
     onnx_path: Path,
     output_path: Path,
     target_platform: str,
     dataset: Optional[Path],
+    test_inputs: Sequence[np.ndarray],
+    expected: np.ndarray,
 ) -> None:
     if RKNN is None:
         raise RuntimeError("rknn-toolkit2 is required for RKNN conversion")
@@ -242,6 +340,11 @@ def _build_one_rknn(
             build_args["dataset"] = str(dataset)
         _require_success(converter.build(**build_args), "build")
         _require_success(converter.export_rknn(str(output_path)), "export_rknn")
+        _require_success(converter.init_runtime(), "init_runtime")
+        outputs = converter.inference(inputs=list(test_inputs))
+        _validate_rknn_outputs(
+            output_path.name, outputs, test_inputs, expected, dataset is not None
+        )
     finally:
         converter.release()
 
@@ -252,9 +355,15 @@ def build_rknn_models(
     rknn_path: Path,
     int8_rknn_path: Path,
     target_platform: str,
+    test_inputs: Sequence[np.ndarray],
+    expected: np.ndarray,
 ) -> None:
-    _build_one_rknn(onnx_path, rknn_path, target_platform, None)
-    _build_one_rknn(onnx_path, int8_rknn_path, target_platform, dataset)
+    _build_one_rknn(
+        onnx_path, rknn_path, target_platform, None, test_inputs, expected
+    )
+    _build_one_rknn(
+        onnx_path, int8_rknn_path, target_platform, dataset, test_inputs, expected
+    )
 
 
 def convert(
@@ -267,11 +376,57 @@ def convert(
     onnx_path = output_dir / "signlang_det_encoder.onnx"
     rknn_path = output_dir / "signlang_det_encoder.rknn"
     int8_path = output_dir / "signlang_det_encoder.int8.rknn"
-    export_onnx(pt_path, onnx_path)
+    features, lengths, expected = export_onnx(pt_path, onnx_path)
     with tempfile.TemporaryDirectory() as directory:
         dataset = prepare_calibration_dataset(calibration_archive, Path(directory) / "calibration")
-        build_rknn_models(onnx_path, dataset, rknn_path, int8_path, target_platform)
+        build_rknn_models(
+            onnx_path,
+            dataset,
+            rknn_path,
+            int8_path,
+            target_platform,
+            [features, lengths],
+            expected,
+        )
     return [onnx_path, rknn_path, int8_path]
+
+
+def validate_inputs(pt_path: Path, calibration_archive: Path) -> None:
+    load_safe_checkpoint(pt_path)
+    with tempfile.TemporaryDirectory() as directory:
+        prepare_calibration_dataset(calibration_archive, Path(directory) / "calibration")
+
+
+def onnx_reference(onnx_path: Path) -> tuple[list[np.ndarray], np.ndarray]:
+    import onnxruntime as ort
+
+    generator = torch.Generator().manual_seed(20260712)
+    features = torch.randn(FEATURE_SHAPE, generator=generator, dtype=torch.float32).numpy()
+    lengths = np.asarray([47], dtype=np.int32)
+    features[:, 47:] = -100.0
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    expected = session.run(
+        ["frame_embeddings"], {"features": features, "lengths": lengths}
+    )[0]
+    return [features, lengths], expected
+
+
+def verify_exported_rknn(output_dir: Path) -> None:
+    if RKNN is None:
+        raise RuntimeError("rknn-toolkit2 is required for RKNN verification")
+    test_inputs, expected = onnx_reference(output_dir / "signlang_det_encoder.onnx")
+    for name, quantized in (
+        ("signlang_det_encoder.rknn", False),
+        ("signlang_det_encoder.int8.rknn", True),
+    ):
+        converter = RKNN(verbose=False)
+        try:
+            _require_success(converter.load_rknn(str(output_dir / name)), "load_rknn")
+            _require_success(converter.init_runtime(), "init_runtime")
+            outputs = converter.inference(inputs=test_inputs)
+            _validate_rknn_outputs(name, outputs, test_inputs, expected, quantized)
+        finally:
+            converter.release()
 
 
 def parser() -> argparse.ArgumentParser:
@@ -280,12 +435,21 @@ def parser() -> argparse.ArgumentParser:
     command.add_argument("--calibration", type=Path, required=True)
     command.add_argument("--output-dir", type=Path, required=True)
     command.add_argument("--target-platform", default="rk3588")
+    command.add_argument("--validate-only", action="store_true")
+    command.add_argument("--verify-rknn-only", action="store_true")
     return command
 
 
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser().parse_args(argv)
-    convert(args.pt, args.calibration, args.output_dir, args.target_platform)
+    if args.validate_only and args.verify_rknn_only:
+        raise ValueError("Only one validation mode can be selected")
+    if args.validate_only:
+        validate_inputs(args.pt, args.calibration)
+    elif args.verify_rknn_only:
+        verify_exported_rknn(args.output_dir)
+    else:
+        convert(args.pt, args.calibration, args.output_dir, args.target_platform)
 
 
 if __name__ == "__main__":
