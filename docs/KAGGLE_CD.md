@@ -29,7 +29,7 @@ The worker uses isolated jobs because steps in one GitHub Actions job share the 
 Pushing any Git tag creates a readable draft Release backed by hidden machine state as a durable FIFO queue item. One serialized worker advances a single transition on each invocation:
 
 1. Resolve the account identity from `KAGGLE_API_TOKEN`, then upload the notebook from the exact tagged commit to that account's `${KAGGLE_KERNEL_SLUG}`.
-2. Record the returned numeric Kaggle version in the draft Release. The Git tag is also injected into the uploaded copy as provenance, because Kaggle version names are numeric and cannot be replaced by arbitrary tag names.
+2. Record the returned numeric Kaggle version in the draft Release as the stable-kernel run identity. The uploaded Notebook is the unmodified file from the tagged commit; CD does not inject custom Notebook metadata.
 3. Let the scheduled workflow check the active run every ten minutes.
 4. Download successful output, require its exact file allowlist, and pass it to an isolated conversion job as a run-scoped GitHub Actions artifact.
 5. In the Python 3.10 conversion job, verify and convert the final PT encoder to ONNX, then create non-quantized and INT8 RKNN models for `${RKNN_TARGET_PLATFORM}`. ONNX Runtime must numerically match PyTorch before either RKNN build starts.
@@ -37,7 +37,7 @@ Pushing any Git tag creates a readable draft Release backed by hidden machine st
 
 Only one queue item may be `starting` or `running`. Later tags remain queued. An already-running external version of the same stable kernel is allowed to finish before the queue continues.
 
-If a draft Release's hidden tag becomes stale after a GitHub-side edit or migration, the worker repairs it from the Release's current `tag_name`. Before any upload, the resolved Git tag commit must still exactly match the queued `git_sha`.
+If a draft Release's hidden tag becomes stale after a GitHub-side edit or migration, the worker repairs it from the Release's current `tag_name`. Before any upload, the resolved Git tag commit must still exactly match the queued `git_sha`. Before downloading completed output, the latest numeric Kaggle version must match the version recorded after submission.
 
 Each published Release contains exactly:
 

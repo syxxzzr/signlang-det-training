@@ -195,19 +195,6 @@ def build_kernel_metadata(username: str, slug: str, private: bool) -> dict[str, 
     }
 
 
-def inject_provenance(notebook: Mapping[str, Any], tag: str, git_sha: str, repository: str) -> dict[str, Any]:
-    output = copy.deepcopy(dict(notebook))
-    metadata = output.setdefault("metadata", {})
-    metadata.pop("kaggle", None)
-    metadata.pop("accelerator", None)
-    metadata["signlang_cd"] = {
-        "release_tag": tag,
-        "git_sha": git_sha,
-        "repository": repository,
-    }
-    return output
-
-
 def sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
@@ -380,13 +367,8 @@ class KaggleClient:
             if self._kernel_missing(exc):
                 return None
             raise
-        try:
-            notebook = json.loads(response.blob.source)
-        except (TypeError, json.JSONDecodeError):
-            notebook = {}
         return {
             "version": int(response.metadata.current_version_number),
-            "provenance": notebook.get("metadata", {}).get("signlang_cd", {}),
             "url": f"https://www.kaggle.com/code/{self.config.kernel_ref}",
         }
 
@@ -433,19 +415,30 @@ def stage_upload(state: Mapping[str, Any], config: Config, folder: Path) -> None
     if resolved.strip() != git_sha:
         raise RuntimeError(f"Tag {tag} resolves to {resolved.strip()}, expected {git_sha}")
     notebook_text = subprocess.check_output(["git", "show", f"{git_sha}:{NOTEBOOK_PATH}"], text=True)
-    notebook = json.loads(notebook_text)
-    injected = inject_provenance(notebook, tag, git_sha, config.repository)
     folder.mkdir(parents=True, exist_ok=True)
-    (folder / NOTEBOOK_PATH).write_text(json.dumps(injected, ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+    (folder / NOTEBOOK_PATH).write_text(notebook_text, encoding="utf-8")
     metadata = build_kernel_metadata(config.kaggle_username, config.kernel_slug, config.kernel_private)
     (folder / "kernel-metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def provenance_matches(latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]) -> bool:
-    if latest is None:
-        return False
-    provenance = latest.get("provenance") or {}
-    return provenance.get("release_tag") == state.get("tag") and provenance.get("git_sha") == state.get("git_sha")
+def latest_version(latest: Optional[Mapping[str, Any]]) -> Optional[int]:
+    if latest is None or latest.get("version") is None:
+        return None
+    return int(latest["version"])
+
+
+def version_matches(latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]) -> bool:
+    expected = state.get("kaggle_version")
+    return expected is not None and latest_version(latest) == int(expected)
+
+
+def version_mismatch_message(
+    latest: Optional[Mapping[str, Any]], state: Mapping[str, Any]
+) -> str:
+    return (
+        f"Kaggle latest version {latest_version(latest)!r} does not match "
+        f"expected version {state.get('kaggle_version')!r} for tag {state.get('tag')!r}"
+    )
 
 
 def mark_failed(github: GitHubClient, release: Mapping[str, Any], state: dict[str, Any], message: str) -> None:
@@ -454,36 +447,62 @@ def mark_failed(github: GitHubClient, release: Mapping[str, Any], state: dict[st
     print(f"Kaggle CD failed for {state['tag']}: {message}", file=sys.stderr)
 
 
+def fail_job(
+    github: GitHubClient,
+    release: Mapping[str, Any],
+    state: dict[str, Any],
+    message: str,
+) -> None:
+    mark_failed(github, release, state, message)
+    raise RuntimeError(message)
+
+
 def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, Any], state: dict[str, Any], config: Config) -> None:
     previous_version = state.get("kaggle_version")
-    if state.get("state") == "queued":
+    was_queued = state.get("state") == "queued"
+    if was_queued:
         state.update({"state": "starting", "attempt": int(state.get("attempt", 0)) + 1, "failure": None})
+        state.pop("kaggle_version_before_push", None)
         github.update_state(int(release["id"]), state)
 
     latest = kaggle.latest()
     current_status = kaggle.status()
-    recoverable = provenance_matches(latest, state) and (
-        previous_version is None or int(latest["version"]) != int(previous_version)
+    current_version = latest_version(latest)
+    previous_completed = (
+        previous_version is not None
+        and current_version == int(previous_version)
+        and current_status["status"] == "complete"
     )
-    if recoverable:
+    baseline_recorded = "kaggle_version_before_push" in state
+    baseline = state.get("kaggle_version_before_push")
+    push_completed = (
+        not was_queued
+        and baseline_recorded
+        and current_version is not None
+        and (baseline is None or current_version != int(baseline))
+    )
+    if previous_completed or push_completed:
         state.update({
             "state": "running", "kaggle_kernel": config.kernel_ref,
-            "kaggle_version": latest["version"], "kaggle_url": latest["url"],
+            "kaggle_version": current_version, "kaggle_url": latest["url"],
             "started_at": state.get("started_at", isoformat()), "last_polled_at": None,
         })
         github.update_state(int(release["id"]), state)
-        print(f"Recovered Kaggle version {latest['version']} for {state['tag']}")
+        print(f"Recovered Kaggle version {current_version} for {state['tag']}")
         return
     if current_status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
         state.update({
             "waiting_for_external_run": True,
             "last_polled_at": isoformat(),
             "external_status": current_status["status"],
+            "kaggle_version_before_push": current_version,
         })
         github.update_state(int(release["id"]), state)
         print(f"Waiting for an existing Kaggle run with status {current_status['status']}")
         return
 
+    state["kaggle_version_before_push"] = current_version
+    github.update_state(int(release["id"]), state)
     with tempfile.TemporaryDirectory() as directory:
         upload_dir = Path(directory) / "upload"
         stage_upload(state, config, upload_dir)
@@ -723,8 +742,8 @@ def prepare_handoff(
     handoff_dir: Path,
 ) -> None:
     latest = kaggle.latest()
-    if not provenance_matches(latest, state) or int(latest["version"]) != int(state["kaggle_version"]):
-        raise RuntimeError("Latest Kaggle notebook provenance/version does not match the queued tag")
+    if not version_matches(latest, state):
+        raise RuntimeError(version_mismatch_message(latest, state))
     if handoff_dir.exists():
         shutil.rmtree(handoff_dir)
     output_dir = handoff_dir / "output"
@@ -836,14 +855,14 @@ def poll_job(
     latest = kaggle.latest()
     status = kaggle.status()
     state["last_polled_at"] = isoformat()
-    if not provenance_matches(latest, state) or int(latest["version"]) != int(state["kaggle_version"]):
+    if not version_matches(latest, state):
+        message = version_mismatch_message(latest, state)
         if status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
             state["external_status"] = status["status"]
             github.update_state(int(release["id"]), state)
-            print("A different Kaggle version is active; waiting to preserve serialization")
+            print(f"{message}; waiting for the active version to finish")
             return
-        mark_failed(github, release, state, "Latest Kaggle version no longer matches this tag")
-        return
+        fail_job(github, release, state, message)
     if status["status"] in {"queued", "running", "new_script", "cancel_requested"}:
         state["kaggle_status"] = status["status"]
         github.update_state(int(release["id"]), state)
@@ -852,7 +871,7 @@ def poll_job(
         prepare_handoff(kaggle, release, state, config, handoff_dir)
     elif status["status"] in {"error", "cancel_acknowledged"}:
         message = status["failure_message"] or f"Kaggle status: {status['status']}"
-        mark_failed(github, release, state, message)
+        fail_job(github, release, state, message)
     else:
         raise RuntimeError(f"Unknown Kaggle status: {status['status']}")
 
@@ -874,6 +893,7 @@ def retry(args: argparse.Namespace) -> None:
     if state.get("state") != "failed":
         raise RuntimeError(f"Only failed jobs can be retried; {args.tag} is {state.get('state')}")
     state.update({"state": "queued", "failure": None, "queued_at": isoformat(), "last_polled_at": None})
+    state.pop("kaggle_version_before_push", None)
     github.update_state(int(release["id"]), state)
     print(f"Requeued {args.tag}")
 
