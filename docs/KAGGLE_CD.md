@@ -22,7 +22,7 @@ Optional GitHub Actions variables:
 
 Kaggle's standard `kernel-metadata.json` sets `machine_shape` to `NvidiaTeslaT4`, enables GPU execution, and attaches the competition and notebook-output sources. The workflow pins an official Kaggle CLI release that passes this field to the kernel save request. The run will fail at Kaggle submission time if that accelerator is unavailable or not permitted for the account; it does not silently request a different GPU class.
 
-Both workflows use Python 3.10. The worker conversion environment pins `setuptools<81`, `onnx==1.16.1`, `onnxruntime==1.23.2`, and `rknn-toolkit2==2.3.2`. ONNX 1.16.1 is required because RKNN Toolkit 2.3.2 still uses its legacy `onnx.mapping` API.
+The worker uses isolated jobs because steps in one GitHub Actions job share the same Python environment. Kaggle submission and polling use Python 3.11 with the pinned Kaggle CLI commit. Model conversion runs separately on Python 3.10 and pins `setuptools<81`, `numpy==1.26.4`, `torch==2.4.0`, `onnx==1.16.1`, `onnxruntime==1.23.2`, and `rknn-toolkit2==2.3.2`. ONNX 1.16.1 is required because RKNN Toolkit 2.3.2 still uses its legacy `onnx.mapping` API. Queue updates and Release publication use Python 3.12 without third-party Python packages.
 
 ## Delivery flow
 
@@ -31,9 +31,9 @@ Pushing any Git tag creates a readable draft Release backed by hidden machine st
 1. Resolve the account identity from `KAGGLE_API_TOKEN`, then upload the notebook from the exact tagged commit to that account's `${KAGGLE_KERNEL_SLUG}`.
 2. Record the returned numeric Kaggle version in the draft Release. The Git tag is also injected into the uploaded copy as provenance, because Kaggle version names are numeric and cannot be replaced by arbitrary tag names.
 3. Let the scheduled workflow check the active run every ten minutes.
-4. Download successful output and require its exact file allowlist.
-5. Verify and convert the final PT encoder to ONNX, then create non-quantized and INT8 RKNN models for `${RKNN_TARGET_PLATFORM}`. ONNX Runtime must numerically match PyTorch before either RKNN build starts.
-6. Create a model manifest, upload the seven required assets, and publish the Release.
+4. Download successful output, require its exact file allowlist, and pass it to an isolated conversion job as a run-scoped GitHub Actions artifact.
+5. In the Python 3.10 conversion job, verify and convert the final PT encoder to ONNX, then create non-quantized and INT8 RKNN models for `${RKNN_TARGET_PLATFORM}`. ONNX Runtime must numerically match PyTorch before either RKNN build starts.
+6. Pass the seven prepared assets to an isolated publishing job, revalidate the draft Release state, upload the assets, and publish the Release.
 
 Only one queue item may be `starting` or `running`. Later tags remain queued. An already-running external version of the same stable kernel is allowed to finish before the queue continues.
 
