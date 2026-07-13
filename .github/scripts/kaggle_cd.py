@@ -31,6 +31,7 @@ STATE_SCHEMA = "signlang-kaggle-cd-v1"
 HANDOFF_SCHEMA = "signlang-kaggle-cd-handoff-v1"
 ACTIVE_STATES = {"starting", "running"}
 NOTEBOOK_PATH = "signlang_det_kaggle_training.ipynb"
+NOTEBOOK_OUTPUT_ROOT = "signlang-det"
 DEFAULT_KERNEL_SLUG = "signlang-det-training"
 GOOGLE_ASL_COMPETITION = "asl-signs"
 TARGET_KERNEL_SOURCE = "abdelrhmankaram/asl-preprocessing-7"
@@ -409,7 +410,9 @@ class KaggleClient:
 
     def download_output(self, destination: Path) -> None:
         destination.mkdir(parents=True, exist_ok=True)
-        file_pattern = "^(?:" + "|".join(map(re.escape, NOTEBOOK_OUTPUT_FILES)) + ")$"
+        output_root = re.escape(NOTEBOOK_OUTPUT_ROOT)
+        expected_files = "|".join(map(re.escape, NOTEBOOK_OUTPUT_FILES))
+        file_pattern = rf"^(?:{output_root}/)?(?:{expected_files})$"
         self.api.kernels_output(
             self.config.kernel_ref,
             str(destination),
@@ -790,7 +793,6 @@ def prepare_handoff(
         shutil.rmtree(handoff_dir)
     output_dir = handoff_dir / "output"
     kaggle.download_output(output_dir)
-    find_notebook_output_root(output_dir)
     downloaded_version = kaggle.latest()
     if not version_matches(downloaded_version, state):
         shutil.rmtree(handoff_dir)
@@ -798,6 +800,7 @@ def prepare_handoff(
             "Kaggle version changed while downloading output: "
             + version_mismatch_message(downloaded_version, state)
         )
+    find_notebook_output_root(output_dir)
     metadata = {
         "schema": HANDOFF_SCHEMA,
         "release_id": int(release["id"]),
