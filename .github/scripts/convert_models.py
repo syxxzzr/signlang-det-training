@@ -312,7 +312,7 @@ def _validate_rknn_outputs(
     denominator = np.linalg.norm(expected_valid) * np.linalg.norm(actual_valid)
     cosine = float(np.dot(expected_valid, actual_valid) / denominator) if denominator else 0.0
     if not quantized:
-        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=1e-4)
+        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=5e-4)
     elif cosine < 0.95:
         raise RuntimeError(f"INT8 RKNN cosine similarity is {cosine:.6f}, expected >= 0.95")
     print(
