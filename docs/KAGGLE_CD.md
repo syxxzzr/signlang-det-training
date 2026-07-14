@@ -53,7 +53,7 @@ Each published Release contains exactly:
 
 The Notebook selects up to 100 target-training samples with a deterministic random seed for INT8 calibration. Conversion accepts only the expected regular calibration files and enforces compressed, expanded, member-count, and per-file size limits. Any missing or unexpected Notebook output prevents Release publication.
 
-The manifest records I/O per model format. PT accepts a variable batch, while ONNX and both RKNN files use batch size 1. RKNN Toolkit changes the INT8 model's feature input and embedding output to `int8`; their embedded scale and zero-point must be queried through RKNN Runtime. The sequence-length input remains `int32`.
+The manifest records I/O per model format. PT accepts a variable batch, while ONNX and both RKNN files use batch size 1. Accuracy-guarded hybrid quantization changes the INT8 model's feature input to `int8`, whose embedded scale and zero-point must be queried through RKNN Runtime, while retaining the embedding output as `float16`. The sequence-length input remains `int32`.
 
 ## Operations
 
