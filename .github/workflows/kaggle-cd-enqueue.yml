@@ -35,9 +35,16 @@ jobs:
             --tag "$RELEASE_TAG" \
             --sha "$RELEASE_SHA"
 
+      - name: Enable scheduled worker
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: gh workflow enable kaggle-cd-worker.yml
+
       - name: Request an immediate worker tick
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           gh workflow run kaggle-cd-worker.yml \

@@ -59,7 +59,9 @@ The manifest records I/O per model format. PT accepts a variable batch, while ON
 
 Use **Kaggle CD - scheduled worker → Run workflow** on the repository's default branch to request an immediate poll. The workflow rejects manual runs from another branch or tag. Each invocation still performs only one status check.
 
-If a job reaches `failed`, run the same workflow with `retry_tag` set to its exact Git tag. The failed draft Release is returned to the queue. A previously acknowledged completed Kaggle version is reused; otherwise a new version is submitted. Transient API failures while a running version is active leave it recoverable for the next scheduled run.
+When model conversion fails, failure finalization marks the Draft Release as `failed` and disables **Kaggle CD - scheduled worker**, stopping future scheduled polls. Pushing a new Git tag automatically re-enables the worker before requesting its immediate queue tick. A Release-publication failure does not disable the worker because model conversion already succeeded.
+
+To retry the same failed tag after a conversion failure, first enable **Kaggle CD - scheduled worker** from the Actions page, then run it with `retry_tag` set to the exact Git tag. The failed draft Release is returned to the queue. A previously acknowledged completed Kaggle version is reused; otherwise a new version is submitted. Transient API failures while a running version is active leave it recoverable for the next scheduled run.
 
 The Kaggle kernel and RKNN target are immutable after a queue item starts. Rotating the API token is safe when it resolves to the same Kaggle account, but changing the token owner, `KAGGLE_KERNEL_SLUG`, or `RKNN_TARGET_PLATFORM` makes an active or retried item fail with a configuration-drift message. Restore the locked configuration before retrying. Use a new Git tag when intentionally changing the destination kernel or RKNN target.
 

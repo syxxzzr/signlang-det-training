@@ -210,6 +210,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: write
       contents: write
     steps:
       - name: Check out repository
@@ -245,3 +246,25 @@ jobs:
             --handoff-dir "$HANDOFF_DIR" \
             --phase "$phase" \
             --run-url "$RUN_URL"
+
+      - name: Disable scheduled worker after model conversion failure
+        if: ${{ always() && needs.convert.result != 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable kaggle-cd-worker.yml
+
+      - name: Probe queue after disabling scheduled worker
+        id: post_failure_probe
+        if: ${{ always() && needs.convert.result != 'success' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+        run: python .github/scripts/kaggle_cd.py probe >> "$GITHUB_OUTPUT"
+
+      - name: Re-enable worker when another tag is queued
+        if: >-
+          ${{ always() && needs.convert.result != 'success' &&
+              steps.post_failure_probe.outputs.queue_action == 'start' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow enable kaggle-cd-worker.yml
