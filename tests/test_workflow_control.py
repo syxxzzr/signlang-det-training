@@ -3,53 +3,50 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).parents[1]
-WORKER_WORKFLOW = ROOT / ".github" / "workflows" / "kaggle-cd-worker.yml"
-ENQUEUE_WORKFLOW = ROOT / ".github" / "workflows" / "kaggle-cd-enqueue.yml"
+SUBMIT_WORKFLOW = ROOT / ".github" / "workflows" / "kaggle-cd-submit.yml"
+REGISTER_TAG_WORKFLOW = ROOT / ".github" / "workflows" / "kaggle-cd-register-tag.yml"
+ISSUE_WORKFLOW = ROOT / ".github" / "workflows" / "kaggle-cd-issue-convert.yml"
 
 
 class WorkflowControlTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.worker = WORKER_WORKFLOW.read_text(encoding="utf-8")
-        cls.enqueue = ENQUEUE_WORKFLOW.read_text(encoding="utf-8")
+        cls.submit = SUBMIT_WORKFLOW.read_text(encoding="utf-8")
+        cls.register = REGISTER_TAG_WORKFLOW.read_text(encoding="utf-8")
+        cls.issue = ISSUE_WORKFLOW.read_text(encoding="utf-8")
 
-    def test_conversion_failure_disables_scheduled_worker(self):
-        finalize = self.worker.split("  finalize-failure:\n", 1)[1]
-        permissions = finalize.split("    steps:\n", 1)[0]
-        self.assertIn("      actions: write\n", permissions)
+    def test_submit_workflow_has_no_scheduled_polling_or_conversion(self):
+        self.assertNotIn("  schedule:\n", self.submit)
+        self.assertIn("python .github/scripts/kaggle_cd.py submit", self.submit)
+        self.assertIn("      issues: write\n", self.submit)
+        self.assertNotIn("convert-handoff", self.submit)
+        self.assertNotIn("kernels_output", self.submit)
 
-        step_name = "      - name: Disable scheduled worker after model conversion failure\n"
-        self.assertIn(step_name, finalize)
-        disable_step = finalize.split(step_name, 1)[1]
-        self.assertIn(
-            "        if: ${{ always() && needs.convert.result != 'success' }}\n",
-            disable_step,
-        )
-        self.assertIn("          GH_TOKEN: ${{ github.token }}\n", disable_step)
-        self.assertIn("        run: gh workflow disable kaggle-cd-worker.yml\n", disable_step)
+    def test_tag_registration_can_create_issue_and_dispatch_submission(self):
+        permissions = self.register.split("jobs:\n", 1)[0]
+        self.assertIn("  issues: write\n", permissions)
+        self.assertIn("python .github/scripts/kaggle_cd.py register-tag", self.register)
+        self.assertIn("gh workflow run kaggle-cd-submit.yml", self.register)
+        self.assertNotIn("gh workflow enable", self.register)
 
-    def test_tag_enqueue_enables_worker_before_immediate_dispatch(self):
-        enable = "gh workflow enable kaggle-cd-worker.yml"
-        dispatch = "gh workflow run kaggle-cd-worker.yml"
-        self.assertIn(enable, self.enqueue)
-        self.assertIn(dispatch, self.enqueue)
-        self.assertLess(self.enqueue.index(enable), self.enqueue.index(dispatch))
+    def test_issue_workflow_requires_a_locked_upload_issue(self):
+        self.assertIn("issue_comment:\n", self.issue)
+        self.assertIn("github.event.issue.locked", self.issue)
+        self.assertIn("Kaggle output upload · ", self.issue)
+        self.assertNotIn("comment.user.login", self.issue)
 
-    def test_failure_finalizer_reenables_worker_when_queue_has_work(self):
-        finalize = self.worker.split("  finalize-failure:\n", 1)[1]
-        disable = "gh workflow disable kaggle-cd-worker.yml"
-        probe = "python .github/scripts/kaggle_cd.py probe"
-        enable = "gh workflow enable kaggle-cd-worker.yml"
-        self.assertIn(disable, finalize)
-        self.assertIn(probe, finalize)
-        self.assertIn("steps.post_failure_probe.outputs.queue_action == 'start'", finalize)
-        self.assertIn(enable, finalize)
-        self.assertLess(finalize.index(disable), finalize.index(probe))
-        self.assertLess(finalize.index(probe), finalize.index(enable))
+    def test_issue_workflow_drains_then_starts_next_tag(self):
+        drain = "python .github/scripts/kaggle_cd.py process-issue"
+        dispatch = "gh workflow run kaggle-cd-submit.yml"
+        self.assertIn(drain, self.issue)
+        self.assertIn("steps.drain.outputs.published == 'true'", self.issue)
+        self.assertIn(dispatch, self.issue)
+        self.assertLess(self.issue.index(drain), self.issue.index(dispatch))
 
-    def test_schedule_avoids_round_number_peak_minutes(self):
-        self.assertIn('    - cron: "7-57/10 * * * *"\n', self.worker)
-        self.assertNotIn('    - cron: "*/10 * * * *"\n', self.worker)
+    def test_python_downloads_use_nju_mirror(self):
+        mirror = "PIP_INDEX_URL: https://mirrors.nju.edu.cn/pypi/web/simple"
+        self.assertIn(mirror, self.submit)
+        self.assertIn(mirror, self.issue)
 
 
 if __name__ == "__main__":

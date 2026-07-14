@@ -1,4 +1,4 @@
-name: Kaggle CD - enqueue tag
+name: Kaggle CD - register tag
 
 on:
   push:
@@ -8,9 +8,10 @@ on:
 permissions:
   actions: write
   contents: write
+  issues: write
 
 jobs:
-  enqueue:
+  register:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -24,30 +25,20 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Enqueue tag as a draft release
+      - name: Register tagged delivery
         env:
           GH_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           RELEASE_TAG: ${{ github.ref_name }}
         run: |
           RELEASE_SHA="$(git rev-parse "${RELEASE_TAG}^{commit}")"
-          python .github/scripts/kaggle_cd.py enqueue \
+          python .github/scripts/kaggle_cd.py register-tag \
             --tag "$RELEASE_TAG" \
             --sha "$RELEASE_SHA"
 
-      - name: Enable scheduled worker
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: gh workflow enable kaggle-cd-worker.yml
-
-      - name: Request an immediate worker tick
+      - name: Request immediate Kaggle submission
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          gh workflow run kaggle-cd-worker.yml \
-            --ref "$DEFAULT_BRANCH" || {
-              echo "::warning::Immediate worker dispatch failed; the scheduled worker will process the queue."
-            }
+        run: gh workflow run kaggle-cd-submit.yml --ref "$DEFAULT_BRANCH"
