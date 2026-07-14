@@ -20,7 +20,7 @@ Optional GitHub Actions variables:
 | `KAGGLE_KERNEL_PRIVATE` | `true` | Whether the destination kernel is private |
 | `RKNN_TARGET_PLATFORM` | `rk3588` | RKNN target passed to RKNN Toolkit 2 |
 
-Kaggle metadata requests an `NvidiaTeslaT4`, enables GPU execution, and attaches the required competition and notebook-output source. The workflow pins the Kaggle CLI commit that supports this machine shape. Python packages in GitHub Actions use the Nanjing University PyPI mirror.
+Kaggle metadata requests an `NvidiaTeslaT4`, enables GPU execution, and attaches the required competition and notebook-output source. The workflow pins the Kaggle CLI commit that supports this machine shape. Python packages in GitHub Actions use pip's default package index. Conversion pins ONNX 1.16.1 and Protobuf 4.25.4 because RKNN Toolkit 2.3.2 depends on their legacy APIs.
 
 ## Delivery flow
 

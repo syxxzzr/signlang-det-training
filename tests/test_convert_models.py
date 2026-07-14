@@ -100,7 +100,7 @@ class RknnBuildTests(unittest.TestCase):
                 Path("encoder.int8.rknn"),
                 "rk3588",
                 Path("dataset.txt"),
-                [object(), object()],
+                [object()],
                 expected,
             )
         finally:
@@ -121,6 +121,7 @@ class RknnBuildTests(unittest.TestCase):
         )
         self.assertTrue(calls["released"])
         self.assertTrue(calls["validated"][-1])
+        self.assertEqual(len(calls["validated"][2]), 1)
 
     def test_fp_build_does_not_enable_hybrid_quantization(self):
         calls = {}
@@ -147,6 +148,7 @@ class RknnBuildTests(unittest.TestCase):
                 return 0
 
             def inference(self, inputs):
+                calls["inference_inputs"] = inputs
                 return [object()]
 
             def release(self):
@@ -162,7 +164,7 @@ class RknnBuildTests(unittest.TestCase):
                 Path("encoder.rknn"),
                 "rk3588",
                 None,
-                [object(), object()],
+                [object()],
                 object(),
             )
         finally:
@@ -171,7 +173,67 @@ class RknnBuildTests(unittest.TestCase):
 
         self.assertEqual(calls["config"], {"target_platform": "rk3588"})
         self.assertEqual(calls["build"], {"do_quantization": False})
+        self.assertEqual(len(calls["inference_inputs"]), 1)
         self.assertTrue(calls["released"])
+
+    def test_deployment_wrapper_derives_padding_mask_from_landmarks(self):
+        calls = {}
+
+        class FakeValidMask:
+            def to(self, dtype):
+                calls["length_dtype"] = dtype
+                return "lengths"
+
+        class FakePaddingMask:
+            def __invert__(self):
+                calls["inverted"] = True
+                return "valid-mask"
+
+        class FakeLandmarks:
+            def __lt__(self, value):
+                calls["padding_threshold"] = value
+                return "padding-comparison"
+
+        class FakeEncoder:
+            def __call__(self, landmarks, lengths):
+                calls["encoder"] = (landmarks, lengths)
+                return "frame-embeddings"
+
+        original_all = getattr(self.module.torch, "all", None)
+        original_sum = getattr(self.module.torch, "sum", None)
+        original_int32 = getattr(self.module.torch, "int32", None)
+        self.module.torch.int32 = "int32"
+        self.module.torch.all = lambda value, dim: calls.update(
+            reduction=(value, dim)
+        ) or FakePaddingMask()
+        self.module.torch.sum = lambda value, dim: calls.update(
+            summation=(value, dim)
+        ) or FakeValidMask()
+        try:
+            landmarks = FakeLandmarks()
+            wrapper = self.module.DeploymentEncoder(FakeEncoder())
+            output = wrapper.forward(landmarks)
+        finally:
+            if original_all is None:
+                delattr(self.module.torch, "all")
+            else:
+                self.module.torch.all = original_all
+            if original_sum is None:
+                delattr(self.module.torch, "sum")
+            else:
+                self.module.torch.sum = original_sum
+            if original_int32 is None:
+                delattr(self.module.torch, "int32")
+            else:
+                self.module.torch.int32 = original_int32
+
+        self.assertEqual(calls["padding_threshold"], -50.0)
+        self.assertEqual(calls["reduction"], ("padding-comparison", -1))
+        self.assertTrue(calls["inverted"])
+        self.assertEqual(calls["summation"], ("valid-mask", 1))
+        self.assertEqual(calls["length_dtype"], "int32")
+        self.assertEqual(calls["encoder"], (landmarks, "lengths"))
+        self.assertEqual(output, "frame-embeddings")
 
 
 class ModelManifestTests(unittest.TestCase):
@@ -226,14 +288,16 @@ class ModelManifestTests(unittest.TestCase):
                     sys.modules["torch"] = original_torch
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
+        pt_contract = manifest["models"]["signlang_det_encoder.pt"]["io_contract"]
+        onnx_contract = manifest["models"]["signlang_det_encoder.onnx"]["io_contract"]
         contract = manifest["models"]["signlang_det_encoder.int8.rknn"]["io_contract"]
-        features = contract["inputs"]["features"]
-        lengths = contract["inputs"]["lengths"]
+        landmarks = contract["inputs"]["landmarks"]
         output = contract["outputs"]["frame_embeddings"]
-        self.assertEqual(features["dtype"], "int8")
-        self.assertIn("quantization_parameters", features)
-        self.assertEqual(lengths["dtype"], "int32")
-        self.assertEqual(lengths["shape"], [1])
+        self.assertEqual(set(pt_contract["inputs"]), {"features", "lengths"})
+        self.assertEqual(set(onnx_contract["inputs"]), {"landmarks"})
+        self.assertEqual(onnx_contract["inputs"]["landmarks"]["dtype"], "float32")
+        self.assertEqual(landmarks["dtype"], "int8")
+        self.assertIn("quantization_parameters", landmarks)
         self.assertEqual(output["dtype"], "float16")
         self.assertNotIn("quantization_parameters", output)
 

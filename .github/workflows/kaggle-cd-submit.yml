@@ -25,7 +25,6 @@ jobs:
       KAGGLE_KERNEL_SLUG: ${{ vars.KAGGLE_KERNEL_SLUG || 'signlang-det-training' }}
       KAGGLE_KERNEL_PRIVATE: ${{ vars.KAGGLE_KERNEL_PRIVATE || 'true' }}
       RKNN_TARGET_PLATFORM: ${{ vars.RKNN_TARGET_PLATFORM || 'rk3588' }}
-      PIP_INDEX_URL: https://mirrors.nju.edu.cn/pypi/web/simple
     steps:
       - name: Require the default branch
         env:

@@ -43,10 +43,15 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertIn(dispatch, self.issue)
         self.assertLess(self.issue.index(drain), self.issue.index(dispatch))
 
-    def test_python_downloads_use_nju_mirror(self):
-        mirror = "PIP_INDEX_URL: https://mirrors.nju.edu.cn/pypi/web/simple"
-        self.assertIn(mirror, self.submit)
-        self.assertIn(mirror, self.issue)
+    def test_python_downloads_use_default_package_index(self):
+        self.assertNotIn("PIP_INDEX_URL", self.submit)
+        self.assertNotIn("PIP_INDEX_URL", self.issue)
+        self.assertNotIn("mirrors.nju.edu.cn", self.submit)
+        self.assertNotIn("mirrors.nju.edu.cn", self.issue)
+
+    def test_conversion_pins_onnx_compatible_protobuf(self):
+        self.assertIn('"onnx==1.16.1"', self.issue)
+        self.assertIn('"protobuf==4.25.4"', self.issue)
 
 
 if __name__ == "__main__":

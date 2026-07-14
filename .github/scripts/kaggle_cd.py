@@ -1048,9 +1048,9 @@ def create_model_manifest(
     }
     feature_contract = copy.deepcopy(payload["input_contract"])
     output_contract = copy.deepcopy(payload["output_contract"])
-    fixed_features = copy.deepcopy(feature_contract)
+    fixed_landmarks = copy.deepcopy(feature_contract)
     fixed_output = copy.deepcopy(output_contract)
-    fixed_features["shape"][0] = 1
+    fixed_landmarks["shape"][0] = 1
     fixed_output["shape"][0] = 1
     pt_io = {
         "inputs": {
@@ -1060,15 +1060,12 @@ def create_model_manifest(
         "outputs": {"frame_embeddings": output_contract},
     }
     fixed_io = {
-        "inputs": {
-            "features": fixed_features,
-            "lengths": {"dtype": "int32", "shape": [1], "minimum": 1, "maximum": 64},
-        },
+        "inputs": {"landmarks": fixed_landmarks},
         "outputs": {"frame_embeddings": fixed_output},
     }
     int8_io = copy.deepcopy(fixed_io)
-    int8_io["inputs"]["features"]["dtype"] = "int8"
-    int8_io["inputs"]["features"]["quantization_parameters"] = (
+    int8_io["inputs"]["landmarks"]["dtype"] = "int8"
+    int8_io["inputs"]["landmarks"]["quantization_parameters"] = (
         "embedded; query scale and zero_point with RKNN Runtime"
     )
     int8_io["outputs"]["frame_embeddings"]["dtype"] = "float16"

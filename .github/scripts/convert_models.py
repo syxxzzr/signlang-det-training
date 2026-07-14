@@ -27,6 +27,8 @@ PREPROCESSING_CONTRACT = "hand168-temporal"
 FEATURE_SHAPE = (1, 64, 168)
 LENGTH_SHAPE = (1,)
 OUTPUT_SHAPE = (1, 64, 128)
+PADDING_VALUE = -100.0
+PADDING_DETECTION_THRESHOLD = -50.0
 CALIBRATION_MAX_SAMPLES = 100
 CALIBRATION_MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 CALIBRATION_MAX_MEMBER_BYTES = 1024 * 1024
@@ -88,9 +90,10 @@ class HandEncoder(nn.Module):
         self.output = nn.Linear(fusion_dim, embedding_dim)
         nn.init.trunc_normal_(self.position, std=0.02)
 
-    def forward(self, features: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+    def forward_with_padding_mask(
+        self, features: torch.Tensor, mask: torch.Tensor
+    ) -> torch.Tensor:
         steps = features.shape[1]
-        mask = torch.arange(steps, device=features.device)[None] >= lengths[:, None]
         inputs = features.masked_fill(mask[..., None], 0.0).reshape(
             features.shape[0], steps, 2, 84
         )
@@ -102,6 +105,46 @@ class HandEncoder(nn.Module):
         fused = self.transformer(fused, src_key_padding_mask=mask)
         output = F.normalize(self.output(fused), dim=-1)
         return output.masked_fill(mask[..., None], 0.0)
+
+    def forward(self, features: torch.Tensor, lengths: torch.Tensor) -> torch.Tensor:
+        steps = features.shape[1]
+        mask = torch.arange(steps, device=features.device)[None] >= lengths[:, None]
+        return self.forward_with_padding_mask(features, mask)
+
+
+class DeploymentEncoder(nn.Module):
+    """Expose the runtime contract while keeping lengths internal to the export graph."""
+
+    def __init__(self, encoder: HandEncoder):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, landmarks: torch.Tensor) -> torch.Tensor:
+        # RKNN INT8 input dequantization may not reproduce -100.0 bit-exactly.
+        # Conforming valid features are far above this midpoint, so the threshold
+        # preserves the external padding contract while remaining quantization-safe.
+        padding_mask = torch.all(landmarks < PADDING_DETECTION_THRESHOLD, dim=-1)
+        lengths = torch.sum(~padding_mask, dim=1).to(torch.int32)
+        return self.encoder(landmarks, lengths)
+
+
+def infer_lengths_from_landmarks(landmarks: np.ndarray) -> np.ndarray:
+    values = np.asarray(landmarks)
+    if values.dtype != np.float32 or tuple(values.shape) != FEATURE_SHAPE:
+        raise ValueError(
+            f"Landmarks must be float32 with shape [1, 64, 168], received "
+            f"dtype={values.dtype}, shape={values.shape}"
+        )
+    if not np.isfinite(values).all():
+        raise ValueError("Landmarks contain non-finite values")
+    padding_mask = np.all(values == PADDING_VALUE, axis=-1)
+    lengths = np.sum(~padding_mask, axis=1, dtype=np.int32)
+    if np.any((lengths < 1) | (lengths > FEATURE_SHAPE[1])):
+        raise ValueError(f"Landmark valid lengths are out of range: {lengths.tolist()}")
+    expected_mask = np.arange(FEATURE_SHAPE[1])[None] >= lengths[:, None]
+    if not np.array_equal(padding_mask, expected_mask):
+        raise ValueError("Landmark padding must be contiguous full -100.0 frames on the right")
+    return lengths.astype(np.int32, copy=False)
 
 
 def encoder_fingerprint(state_dict: Mapping[str, torch.Tensor]) -> str:
@@ -153,15 +196,18 @@ def load_encoder(path: Path) -> HandEncoder:
 
 def export_onnx(
     pt_path: Path, onnx_path: Path
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    model = load_encoder(pt_path)
+) -> tuple[np.ndarray, np.ndarray]:
+    encoder = load_encoder(pt_path)
+    model = DeploymentEncoder(encoder).eval()
     generator = torch.Generator().manual_seed(20260712)
-    features = torch.randn(FEATURE_SHAPE, generator=generator, dtype=torch.float32)
+    landmarks = torch.randn(FEATURE_SHAPE, generator=generator, dtype=torch.float32)
     lengths = torch.tensor([47], dtype=torch.int32)
-    features[:, 47:] = -100.0
+    landmarks[:, 47:] = PADDING_VALUE
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
     with torch.inference_mode():
-        expected = model(features, lengths).cpu().numpy()
+        expected = model(landmarks).cpu().numpy()
+        internal = encoder(landmarks, lengths).cpu().numpy()
+        np.testing.assert_allclose(expected, internal, rtol=0.0, atol=0.0)
         fastpath_enabled = torch.backends.mha.get_fastpath_enabled()
         try:
             # The fused eval fast-path emits aten::_transformer_encoder_layer_fwd,
@@ -170,9 +216,9 @@ def export_onnx(
             torch.backends.mha.set_fastpath_enabled(False)
             torch.onnx.export(
                 model,
-                (features, lengths),
+                (landmarks,),
                 onnx_path,
-                input_names=["features", "lengths"],
+                input_names=["landmarks"],
                 output_names=["frame_embeddings"],
                 opset_version=17,
                 do_constant_folding=True,
@@ -185,15 +231,33 @@ def export_onnx(
 
     graph = onnx.load(str(onnx_path))
     onnx.checker.check_model(graph)
+    graph_inputs = [value.name for value in graph.graph.input]
+    graph_outputs = [value.name for value in graph.graph.output]
+    if graph_inputs != ["landmarks"] or graph_outputs != ["frame_embeddings"]:
+        raise RuntimeError(
+            f"ONNX deployment contract mismatch: inputs={graph_inputs}, outputs={graph_outputs}"
+        )
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    actual = session.run(
-        ["frame_embeddings"],
-        {"features": features.numpy(), "lengths": lengths.numpy()},
-    )[0]
+    runtime_inputs = session.get_inputs()
+    runtime_outputs = session.get_outputs()
+    if (
+        len(runtime_inputs) != 1
+        or runtime_inputs[0].name != "landmarks"
+        or runtime_inputs[0].type != "tensor(float)"
+        or runtime_inputs[0].shape != list(FEATURE_SHAPE)
+        or len(runtime_outputs) != 1
+        or runtime_outputs[0].name != "frame_embeddings"
+        or runtime_outputs[0].type != "tensor(float)"
+        or runtime_outputs[0].shape != list(OUTPUT_SHAPE)
+    ):
+        raise RuntimeError(
+            "ONNX Runtime deployment metadata does not match the single-input contract"
+        )
+    actual = session.run(["frame_embeddings"], {"landmarks": landmarks.numpy()})[0]
     if tuple(actual.shape) != OUTPUT_SHAPE:
         raise RuntimeError(f"ONNX output shape is {tuple(actual.shape)}, expected {OUTPUT_SHAPE}")
     np.testing.assert_allclose(actual, expected, rtol=1e-4, atol=1e-5)
-    return features.numpy(), lengths.numpy(), actual
+    return landmarks.numpy(), actual
 
 
 def _safe_members(bundle: tarfile.TarFile) -> list[tarfile.TarInfo]:
@@ -249,7 +313,9 @@ def prepare_calibration_dataset(archive: Path, destination: Path) -> Path:
             raise ValueError("Calibration dataset contains too many samples")
         values = line.split()
         if len(values) != 2:
-            raise ValueError(f"Calibration dataset line {line_number} must contain two inputs")
+            raise ValueError(
+                f"Calibration dataset line {line_number} must contain a feature/length pair"
+            )
         paths = [(destination / value).resolve() for value in values]
         if any(destination.resolve() not in path.parents for path in paths):
             raise ValueError(f"Calibration dataset line {line_number} contains an unsafe path")
@@ -265,8 +331,15 @@ def prepare_calibration_dataset(archive: Path, destination: Path) -> Path:
             raise ValueError(f"Calibration length on line {line_number} is out of range")
         if not np.isfinite(features).all():
             raise ValueError(f"Calibration features on line {line_number} are not finite")
+        inferred_lengths = infer_lengths_from_landmarks(features)
+        if not np.array_equal(inferred_lengths, lengths):
+            raise ValueError(
+                f"Calibration length on line {line_number} does not match -100.0 padding"
+            )
         referenced.update(Path(value) for value in values)
-        resolved_lines.append(" ".join(str(path) for path in paths))
+        # The archive retains lengths for integrity checking, but the deployment
+        # graph derives its mask internally and RKNN calibration receives one input.
+        resolved_lines.append(str(paths[0]))
     if not resolved_lines:
         raise ValueError("Calibration dataset is empty")
     actual_files = {
@@ -295,6 +368,10 @@ def _validate_rknn_outputs(
     expected: np.ndarray,
     quantized: bool,
 ) -> None:
+    if len(test_inputs) != 1:
+        raise RuntimeError(
+            f"RKNN deployment validation received {len(test_inputs)} inputs, expected 1"
+        )
     if not isinstance(outputs, (list, tuple)):
         raise RuntimeError(
             f"RKNN inference returned {type(outputs).__name__}, expected a list of outputs"
@@ -307,7 +384,7 @@ def _validate_rknn_outputs(
         raise RuntimeError(f"RKNN output shape is {tuple(actual.shape)}, expected {OUTPUT_SHAPE}")
     if not np.isfinite(actual).all():
         raise RuntimeError("RKNN inference produced non-finite values")
-    valid_steps = int(test_inputs[1][0])
+    valid_steps = int(infer_lengths_from_landmarks(test_inputs[0])[0])
     expected_valid = expected[:, :valid_steps].astype(np.float64, copy=False).reshape(-1)
     actual_valid = actual[:, :valid_steps].astype(np.float64, copy=False).reshape(-1)
     denominator = np.linalg.norm(expected_valid) * np.linalg.norm(actual_valid)
@@ -316,6 +393,11 @@ def _validate_rknn_outputs(
         np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=5e-4)
     elif cosine < 0.95:
         raise RuntimeError(f"INT8 RKNN cosine similarity is {cosine:.6f}, expected >= 0.95")
+    if valid_steps < OUTPUT_SHAPE[1]:
+        padding_tolerance = 5e-4 if quantized else 1e-6
+        np.testing.assert_allclose(
+            actual[:, valid_steps:], 0.0, rtol=0.0, atol=padding_tolerance
+        )
     print(
         f"Validated {model_name} with RKNN simulator: "
         f"dtype={actual.dtype}, cosine={cosine:.6f}"
@@ -382,7 +464,7 @@ def convert(
     onnx_path = output_dir / "signlang_det_encoder.onnx"
     rknn_path = output_dir / "signlang_det_encoder.rknn"
     int8_path = output_dir / "signlang_det_encoder.int8.rknn"
-    features, lengths, expected = export_onnx(pt_path, onnx_path)
+    landmarks, expected = export_onnx(pt_path, onnx_path)
     with tempfile.TemporaryDirectory() as directory:
         dataset = prepare_calibration_dataset(calibration_archive, Path(directory) / "calibration")
         build_rknn_models(
@@ -391,7 +473,7 @@ def convert(
             rknn_path,
             int8_path,
             target_platform,
-            [features, lengths],
+            [landmarks],
             expected,
         )
     return [onnx_path, rknn_path, int8_path]
@@ -407,14 +489,14 @@ def onnx_reference(onnx_path: Path) -> tuple[list[np.ndarray], np.ndarray]:
     import onnxruntime as ort
 
     generator = torch.Generator().manual_seed(20260712)
-    features = torch.randn(FEATURE_SHAPE, generator=generator, dtype=torch.float32).numpy()
-    lengths = np.asarray([47], dtype=np.int32)
-    features[:, 47:] = -100.0
+    landmarks = torch.randn(FEATURE_SHAPE, generator=generator, dtype=torch.float32).numpy()
+    landmarks[:, 47:] = PADDING_VALUE
     session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
-    expected = session.run(
-        ["frame_embeddings"], {"features": features, "lengths": lengths}
-    )[0]
-    return [features, lengths], expected
+    runtime_inputs = session.get_inputs()
+    if len(runtime_inputs) != 1 or runtime_inputs[0].name != "landmarks":
+        raise RuntimeError("ONNX model does not expose the required landmarks-only input")
+    expected = session.run(["frame_embeddings"], {"landmarks": landmarks})[0]
+    return [landmarks], expected
 
 
 def verify_exported_rknn(output_dir: Path) -> None:
