@@ -12,7 +12,7 @@
 
 完整流程见 [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb)。
 
-项目也支持自动交付带 Tag 的版本：Kaggle CD 会通过同一个稳定 Notebook 串行运行任务，以短时定时 Action 轮询状态，并将完成后的输出发布到对应 GitHub Release。配置和故障恢复方法见 [Kaggle 持续交付说明](docs/KAGGLE_CD.md)。
+项目也支持交付带 Tag 的版本：Kaggle CD 会把排队的 Tag 依次提交到同一个稳定 Kaggle Notebook；训练完成后，由仓库写入者通过锁定的 Issue 上传 ZIP。Issue workflow 会按顺序验证并转换候选包，再发布对应的 GitHub Release。配置和故障恢复方法见 [Kaggle 持续交付说明](docs/KAGGLE_CD.md)。
 
 ## 核心特点 ✨
 

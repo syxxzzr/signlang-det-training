@@ -12,7 +12,7 @@ The temporary classification heads are used only for optimization. They are not 
 
 The complete workflow is available in [signlang_det_kaggle_training.ipynb](signlang_det_kaggle_training.ipynb).
 
-Tagged revisions can also be delivered automatically: the Kaggle CD workflow serializes runs through one stable notebook, polls them in short scheduled Actions invocations, and publishes completed output to the matching GitHub Release. See [Kaggle Continuous Delivery](docs/KAGGLE_CD.md) for setup and recovery instructions.
+Tagged revisions can also be delivered through Kaggle CD: GitHub submits each queued tag to one stable Kaggle notebook, then a repository writer uploads the completed ZIP through a locked Issue. The Issue workflow validates and converts candidates in order before publishing the matching GitHub Release. See [Kaggle Continuous Delivery](docs/KAGGLE_CD.md) for setup and recovery instructions.
 
 ## Highlights ✨
 

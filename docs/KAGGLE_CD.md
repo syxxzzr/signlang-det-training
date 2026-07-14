@@ -1,10 +1,10 @@
 # Kaggle Continuous Delivery
 
-The repository can publish a tagged notebook to one stable Kaggle kernel, wait for its training run across separate GitHub Actions executions, and attach the completed output to the matching GitHub Release.
+The repository submits tagged notebook revisions to one stable Kaggle kernel. Training completion is handed back manually through a locked GitHub Issue; GitHub Actions then validates the uploaded ZIP, converts the model to ONNX and RKNN, and publishes the matching Release. There is no scheduled Kaggle polling and the Kaggle notebook contains no GitHub credential.
 
 ## Setup
 
-Create these GitHub Actions secrets:
+Create this GitHub Actions secret:
 
 | Secret | Purpose |
 |---|---|
@@ -18,28 +18,38 @@ Optional GitHub Actions variables:
 |---|---:|---|
 | `KAGGLE_KERNEL_SLUG` | `signlang-det-training` | Stable destination kernel slug under the authenticated account |
 | `KAGGLE_KERNEL_PRIVATE` | `true` | Whether the destination kernel is private |
-| `RKNN_TARGET_PLATFORM` | `rk3588` | RKNN target platform passed to RKNN Toolkit 2; override it for another supported Rockchip target |
+| `RKNN_TARGET_PLATFORM` | `rk3588` | RKNN target passed to RKNN Toolkit 2 |
 
-Kaggle's standard `kernel-metadata.json` sets `machine_shape` to `NvidiaTeslaT4`, enables GPU execution, and attaches the competition and notebook-output sources. The workflow pins an official Kaggle CLI release that passes this field to the kernel save request. The run will fail at Kaggle submission time if that accelerator is unavailable or not permitted for the account; it does not silently request a different GPU class.
-
-The worker uses isolated jobs because steps in one GitHub Actions job share the same Python environment. A lightweight standard-library probe checks the GitHub Release queue first, so idle ticks do not install or authenticate the Kaggle client. All control-plane operations—queue updates, Kaggle submission and polling, Release publication, and failure finalization—use Python 3.11; only the Kaggle-facing steps install the pinned Kaggle CLI commit. Model conversion runs separately on Python 3.10 and pins `setuptools==79.0.1`, `numpy==1.26.4`, `torch==2.4.0`, `onnx==1.16.1`, `onnxruntime==1.23.2`, and `rknn-toolkit2==2.3.2`. ONNX 1.16.1 is required because RKNN Toolkit 2.3.2 still uses its legacy `onnx.mapping` API.
-
-Every GitHub Action is pinned to a full commit. Write permissions are limited to the jobs that update queue or Release state, and API token environment variables are supplied only to the steps that use them. The conversion job has read-only repository permission, does not persist checkout credentials, and never receives Kaggle or GitHub API tokens.
+Kaggle metadata requests an `NvidiaTeslaT4`, enables GPU execution, and attaches the required competition and notebook-output source. The workflow pins the Kaggle CLI commit that supports this machine shape. Python packages in GitHub Actions use pip's default package index. Conversion pins ONNX 1.16.1 and Protobuf 4.25.4 because RKNN Toolkit 2.3.2 depends on their legacy APIs.
 
 ## Delivery flow
 
-Pushing any Git tag creates a readable draft Release backed by hidden machine state as a durable FIFO queue item. One serialized worker advances a single transition on each invocation:
+Pushing a Git tag performs the following steps:
 
-1. Resolve the account identity from `KAGGLE_API_TOKEN`, then upload the notebook from the exact tagged commit to that account's `${KAGGLE_KERNEL_SLUG}`.
-2. Lock the authenticated Kaggle kernel, returned numeric version, and RKNN target platform in the draft Release. The kernel and version together identify the external run; a version number is never accepted on its own. The uploaded Notebook is the unmodified file from the tagged commit; CD does not inject custom Notebook metadata.
-3. Let the scheduled workflow check the active run every ten minutes.
-4. Check that both the kernel and latest numeric version still match before and after downloading successful output. The downloader removes the Kaggle CLI's generated kernel log, requires the exact Notebook output allowlist, and passes the result to an isolated conversion job as a run-scoped GitHub Actions artifact.
-5. In the Python 3.10 conversion job, safely validate the PT checkpoint and bounded calibration archive, then run the converter from the tagged commit. ONNX Runtime must numerically match PyTorch, and both generated RKNN files must pass simulator inference checks against ONNX.
-6. Pass the seven prepared assets to an isolated publishing job, revalidate the draft Release state and every manifest SHA-256, upload the assets, and publish the Release. Conversion, artifact, or publication failures are written back to the draft as retryable failures.
+1. **Kaggle CD - register tag** registers the tagged delivery as a Draft Release and creates its matching upload Issue.
+2. The upload Issue is locked immediately. GitHub still lets repository writers comment on a locked conversation; no per-user allowlist is applied.
+3. **Kaggle CD - submit next tag** submits the exact tagged notebook to Kaggle and records the returned kernel, numeric version, target platform, and upload Issue in the Draft Release.
+4. GitHub Actions stops. It does not poll Kaggle or keep a runner waiting.
 
-Only one queue item may be `starting` or `running`. Later tags remain queued. An already-running external version of the same stable kernel is allowed to finish before the queue continues. The worker never adopts a numeric version unless its own `kernels_push` call returned that version or a retry references the same previously acknowledged completed version on the locked kernel. An ambiguous interrupted push may therefore create a duplicate training version on the next attempt, but it cannot be mistaken for an external run.
+After training completes, download the Kaggle output ZIP and submit it through the locked Issue in either form:
 
-If a draft Release's hidden tag becomes stale after a GitHub-side edit or migration, the worker repairs it from the Release's current `tag_name`. Before any upload, the resolved Git tag commit must still exactly match the queued `git_sha`. Before downloading completed output, the authenticated account and configured slug must resolve to the locked kernel, and that kernel's latest numeric version must match the version recorded after submission. Legacy v1 queue items bind missing kernel or target fields once only when doing so is unambiguous; a recorded version without a kernel fails closed.
+- attach the ZIP directly to a new Issue comment; or
+- upload it as an asset of the linked Draft Release, then create a comment containing `/convert <exact asset name>`.
+
+The filename and extension are unrestricted. GitHub's own Issue attachment size limit still applies to direct attachments; use a Draft Release asset for a larger file. The downloaded content must be a valid ZIP containing exactly the expected notebook output tree.
+
+Every attachment and every `/convert` command is a durable queue candidate. **Kaggle CD - convert Issue uploads** scans the complete comment history and processes unhandled candidates in comment order. A failed candidate receives a terminal failure comment and the workflow continues to the next queued candidate. If no candidate succeeds, the Issue remains open and another upload or command starts a new drain. Processing markers are non-terminal, so an interrupted workflow retries rather than losing a candidate.
+
+The upload validator accepts only GitHub-hosted attachment or Release-asset downloads, caps compressed and expanded sizes and member count, rejects traversal, links, special files, encryption, duplicates, and unexpected output files, and determines ZIP validity from content instead of filename. Conversion then:
+
+1. validates the PT checkpoint and bounded INT8 calibration archive;
+2. exports ONNX and verifies it numerically against PyTorch;
+3. builds non-quantized and INT8 RKNN models and runs simulator checks against ONNX;
+4. generates the model manifest and reproducible notebook-output archive;
+5. uploads the seven validated Release assets and removes a raw Draft Release input asset;
+6. publishes the Release, posts success, closes the upload Issue, and dispatches **submit next tag** once for the next registered delivery.
+
+Only one tag may be `starting` or `running`. Later tags retain their own Draft Releases and locked Issues but are not submitted until the active tag publishes successfully.
 
 Each published Release contains exactly:
 
@@ -47,22 +57,18 @@ Each published Release contains exactly:
 - `signlang_det_encoder.onnx`;
 - `signlang_det_encoder.rknn`;
 - `signlang_det_encoder.int8.rknn`;
-- `model-manifest.json`, containing model identity/version, architecture and configuration, artifact and tokenizer locations, format-specific runtime dependencies, input/output contracts, provenance, target platform, sizes, and SHA-256 integrity data;
-- `signlang_det_kaggle_training.ipynb` from the exact tagged commit;
-- `notebook-output.tar.gz`, containing the INT8 calibration archive, two charts, two metric CSV files, and two training logs.
-
-The Notebook selects up to 100 target-training samples with a deterministic random seed for INT8 calibration. Conversion accepts only the expected regular calibration files and enforces compressed, expanded, member-count, and per-file size limits. Any missing or unexpected Notebook output prevents Release publication.
-
-The manifest records I/O per model format. PT accepts a variable batch, while ONNX and both RKNN files use batch size 1. Accuracy-guarded hybrid quantization changes the INT8 model's feature input to `int8`, whose embedded scale and zero-point must be queried through RKNN Runtime, while retaining the embedding output as `float16`. The sequence-length input remains `int32`.
+- `model-manifest.json`;
+- `signlang_det_kaggle_training.ipynb` from the tagged commit;
+- `notebook-output.tar.gz` containing the remaining validated notebook outputs.
 
 ## Operations
 
-Use **Kaggle CD - scheduled worker → Run workflow** on the repository's default branch to request an immediate poll. The workflow rejects manual runs from another branch or tag. Each invocation still performs only one status check.
+Watch the linked Kaggle page manually. A Kaggle error, timeout, or cancellation cannot notify GitHub in this design; the Draft Release and Issue remain open for inspection.
 
-When model conversion fails, failure finalization marks the Draft Release as `failed` and disables **Kaggle CD - scheduled worker**, stopping future scheduled polls. Pushing a new Git tag automatically re-enables the worker before requesting its immediate queue tick. A Release-publication failure does not disable the worker because model conversion already succeeded.
+If Kaggle submission itself fails, run **Kaggle CD - submit next tag** from the default branch with `retry_tag` set to the failed tag. It requeues only a Draft Release already marked `failed`. A running delivery is never polled by this workflow.
 
-To retry the same failed tag after a conversion failure, first enable **Kaggle CD - scheduled worker** from the Actions page, then run it with `retry_tag` set to the exact Git tag. The failed draft Release is returned to the queue. A previously acknowledged completed Kaggle version is reused; otherwise a new version is submitted. Transient API failures while a running version is active leave it recoverable for the next scheduled run.
+If an uploaded ZIP fails validation or conversion, inspect the bot's failure comment and add a corrected attachment or `/convert` command. Do not edit an old candidate: new comments provide stable FIFO identity and trigger the workflow. The Issue closes only after Release publication succeeds.
 
-The Kaggle kernel and RKNN target are immutable after a queue item starts. Rotating the API token is safe when it resolves to the same Kaggle account, but changing the token owner, `KAGGLE_KERNEL_SLUG`, or `RKNN_TARGET_PLATFORM` makes an active or retried item fail with a configuration-drift message. Restore the locked configuration before retrying. Use a new Git tag when intentionally changing the destination kernel or RKNN target.
+The conversion workflow may run for up to six hours while draining the candidates visible to it. Workflow concurrency prevents simultaneous drainers for the same Issue. Comments created during an active run trigger one later rescan, while the durable Issue history ensures candidates are not lost if GitHub replaces a pending concurrency run.
 
-The worker never waits for training inside one Actions run. Its concurrency group does not cancel in-progress ticks, draft Releases preserve queue state between executions, and inter-job artifacts are retained for seven days. Re-running all jobs safely overwrites artifacts from the earlier attempt of the same workflow run. **Kaggle CD CI** runs the coordinator tests on Python 3.10 and 3.11 plus `actionlint` on branch pushes and pull requests.
+**Kaggle CD CI** compiles the coordinator and runs repository tests on Python 3.10 and 3.11, then checks all workflows with `actionlint` on branch pushes and pull requests.
