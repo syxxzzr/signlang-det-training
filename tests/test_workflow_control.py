@@ -47,6 +47,10 @@ class WorkflowControlTests(unittest.TestCase):
         self.assertLess(finalize.index(disable), finalize.index(probe))
         self.assertLess(finalize.index(probe), finalize.index(enable))
 
+    def test_schedule_avoids_round_number_peak_minutes(self):
+        self.assertIn('    - cron: "7-57/10 * * * *"\n', self.worker)
+        self.assertNotIn('    - cron: "*/10 * * * *"\n', self.worker)
+
 
 if __name__ == "__main__":
     unittest.main()

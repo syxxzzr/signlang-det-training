@@ -2,7 +2,8 @@ name: Kaggle CD - scheduled worker
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    # Avoid GitHub Actions' heavily loaded round-number scheduling slots.
+    - cron: "7-57/10 * * * *"
   workflow_dispatch:
     inputs:
       retry_tag:
