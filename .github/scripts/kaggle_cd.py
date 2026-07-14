@@ -719,10 +719,7 @@ def create_model_manifest(
     int8_io["inputs"]["features"]["quantization_parameters"] = (
         "embedded; query scale and zero_point with RKNN Runtime"
     )
-    int8_io["outputs"]["frame_embeddings"]["dtype"] = "int8"
-    int8_io["outputs"]["frame_embeddings"]["quantization_parameters"] = (
-        "embedded; query scale and zero_point with RKNN Runtime"
-    )
+    int8_io["outputs"]["frame_embeddings"]["dtype"] = "float16"
     io_contracts = {
         "signlang_det_encoder.pt": pt_io,
         "signlang_det_encoder.onnx": fixed_io,

@@ -32,6 +32,7 @@ CALIBRATION_MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
 CALIBRATION_MAX_MEMBER_BYTES = 1024 * 1024
 CALIBRATION_MAX_EXTRACTED_BYTES = 16 * 1024 * 1024
 CALIBRATION_MAX_MEMBERS = CALIBRATION_MAX_SAMPLES * 2 + 2
+RKNN_AUTO_HYBRID_COS_THRESHOLD = 0.99
 
 
 class TemporalBlock(nn.Module):
@@ -333,11 +334,16 @@ def _build_one_rknn(
         raise RuntimeError("rknn-toolkit2 is required for RKNN conversion")
     converter = RKNN(verbose=False)
     try:
-        _require_success(converter.config(target_platform=target_platform), "config")
+        quantized = dataset is not None
+        config_args = {"target_platform": target_platform}
+        if quantized:
+            config_args["auto_hybrid_cos_thresh"] = RKNN_AUTO_HYBRID_COS_THRESHOLD
+        _require_success(converter.config(**config_args), "config")
         _require_success(converter.load_onnx(model=str(onnx_path)), "load_onnx")
-        build_args = {"do_quantization": dataset is not None}
-        if dataset is not None:
+        build_args = {"do_quantization": quantized}
+        if quantized:
             build_args["dataset"] = str(dataset)
+            build_args["auto_hybrid"] = True
         _require_success(converter.build(**build_args), "build")
         _require_success(converter.export_rknn(str(output_path)), "export_rknn")
         _require_success(converter.init_runtime(), "init_runtime")

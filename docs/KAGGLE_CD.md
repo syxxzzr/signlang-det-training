@@ -53,13 +53,15 @@ Each published Release contains exactly:
 
 The Notebook selects up to 100 target-training samples with a deterministic random seed for INT8 calibration. Conversion accepts only the expected regular calibration files and enforces compressed, expanded, member-count, and per-file size limits. Any missing or unexpected Notebook output prevents Release publication.
 
-The manifest records I/O per model format. PT accepts a variable batch, while ONNX and both RKNN files use batch size 1. RKNN Toolkit changes the INT8 model's feature input and embedding output to `int8`; their embedded scale and zero-point must be queried through RKNN Runtime. The sequence-length input remains `int32`.
+The manifest records I/O per model format. PT accepts a variable batch, while ONNX and both RKNN files use batch size 1. Accuracy-guarded hybrid quantization changes the INT8 model's feature input to `int8`, whose embedded scale and zero-point must be queried through RKNN Runtime, while retaining the embedding output as `float16`. The sequence-length input remains `int32`.
 
 ## Operations
 
 Use **Kaggle CD - scheduled worker → Run workflow** on the repository's default branch to request an immediate poll. The workflow rejects manual runs from another branch or tag. Each invocation still performs only one status check.
 
-If a job reaches `failed`, run the same workflow with `retry_tag` set to its exact Git tag. The failed draft Release is returned to the queue. A previously acknowledged completed Kaggle version is reused; otherwise a new version is submitted. Transient API failures while a running version is active leave it recoverable for the next scheduled run.
+When model conversion fails, failure finalization marks the Draft Release as `failed` and disables **Kaggle CD - scheduled worker**, stopping future scheduled polls. Pushing a new Git tag automatically re-enables the worker before requesting its immediate queue tick. A Release-publication failure does not disable the worker because model conversion already succeeded.
+
+To retry the same failed tag after a conversion failure, first enable **Kaggle CD - scheduled worker** from the Actions page, then run it with `retry_tag` set to the exact Git tag. The failed draft Release is returned to the queue. A previously acknowledged completed Kaggle version is reused; otherwise a new version is submitted. Transient API failures while a running version is active leave it recoverable for the next scheduled run.
 
 The Kaggle kernel and RKNN target are immutable after a queue item starts. Rotating the API token is safe when it resolves to the same Kaggle account, but changing the token owner, `KAGGLE_KERNEL_SLUG`, or `RKNN_TARGET_PLATFORM` makes an active or retried item fail with a configuration-drift message. Restore the locked configuration before retrying. Use a new Git tag when intentionally changing the destination kernel or RKNN target.
 
