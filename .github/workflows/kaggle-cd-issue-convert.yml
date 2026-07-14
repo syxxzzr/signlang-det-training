@@ -21,7 +21,6 @@ jobs:
       actions: write
       contents: write
       issues: write
-    env:
     steps:
       - name: Check out repository and tags
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
