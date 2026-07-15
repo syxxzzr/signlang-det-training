@@ -217,8 +217,29 @@ class IssueQueueTests(unittest.TestCase):
         self.assertIn("Output → Download all", body)
         self.assertIn("Issue attachment", body)
         self.assertIn("/convert <exact asset name>", body)
-        self.assertIn("Add a **new comment** to retry", body)
+        self.assertIn("Add a new comment to retry", body)
         self.assertIn("打开已提交的 Kaggle Notebook", body)
+        self.assertIn("### 1. Download the completed Kaggle output 📥", body)
+        self.assertIn("### 2. Submit a conversion candidate 📦", body)
+        self.assertIn("### Queue and status 📋", body)
+
+    def test_generated_github_bodies_avoid_double_asterisk_markup(self):
+        release = {"id": 9, "html_url": "https://example.invalid/release"}
+        state = {
+            "state": "failed",
+            "tag": "v1",
+            "git_sha": "abc",
+            "attempt": 1,
+            "failure": "example",
+        }
+
+        bodies = (
+            self.module.render_delivery_issue(release, state),
+            self.module.render_release_body(state),
+        )
+
+        for body in bodies:
+            self.assertNotIn("**", body)
 
     def test_queue_continues_after_failure_and_closes_on_first_success(self):
         state = {

@@ -100,7 +100,6 @@ Notebook 默认设置 `num_workers = 0` 并关闭 DataParallel，以提高 Noteb
 | `dtw_window` | `12` | 受限 DTW 窗口 |
 | `resume` | `True` | 恢复兼容的训练状态 |
 | `use_data_parallel` | `False` | 可选的双 GPU 执行路径 |
-| `int8_calibration_samples` | `100` | 确定性抽取并打包用于 RKNN INT8 校准的目标训练样本数 |
 
 正式配置使用 30 epoch × 300 batch 进行通用表示训练，并使用 40 epoch × 200 batch 进行领域适配。这里的 epoch 由固定数量的 P×K batch 组成，不代表完整遍历数据集。
 
@@ -109,12 +108,11 @@ Notebook 默认设置 `num_workers = 0` 并关闭 DataParallel，以提高 Noteb
 Notebook 验证最终编码器后会删除缓存、checkpoint、状态文件和其它中间数据。`/kaggle/working/signlang-det` 最终只包含：
 
 - `signlang_det_encoder.pt`，包含最终编码器契约、权重和指纹；
-- `int8_calibration.tar.gz`，包含最多 100 条确定性抽取的目标训练输入及 RKNN dataset 列表；
 - `figures/training_curves.png` 和 `figures/retrieval_summary.png`；
 - `representation_training/metrics.csv` 和 `domain_adaptation/metrics.csv`；
 - `representation_training/train.log` 和 `domain_adaptation/train.log`。
 
-Kaggle CD 会将 PT 转为 ONNX，再生成非量化和 INT8 两个 RKNN 模型。四个模型、`model-manifest.json` 及 Tag 对应的原始 Notebook 分别作为独立 Release 资产，其余 Notebook 输出统一打包为 `notebook-output.tar.gz`。
+Kaggle CD 会将 PT 转为 ONNX 和 RKNN。三个模型、`model-manifest.json` 及 Tag 对应的原始 Notebook 分别作为独立 Release 资产，其余 Notebook 输出统一打包为 `notebook-output.tar.gz`。
 每个动态原型都必须同时保存编码器指纹和 `hand168-temporal` 预处理标识。由其他编码器或预处理契约生成的原型不能与当前导出模型混用。
 
 ## 限制与校准 ⚠️

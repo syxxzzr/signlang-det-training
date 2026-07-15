@@ -42,11 +42,11 @@ Every trusted attachment and every trusted `/convert` command is a durable queue
 
 The upload validator accepts only GitHub-hosted attachment or Release-asset downloads, caps compressed and expanded sizes and member count, rejects traversal, links, special files, encryption, duplicates, and unexpected output files, and determines ZIP validity from content instead of filename. Conversion then:
 
-1. validates the PT checkpoint and bounded INT8 calibration archive;
+1. validates the PT checkpoint;
 2. exports ONNX and verifies it numerically against PyTorch;
-3. builds non-quantized and INT8 RKNN models and runs simulator checks against ONNX;
+3. builds the RKNN model and runs simulator checks against ONNX;
 4. generates the model manifest and reproducible notebook-output archive;
-5. uploads the seven validated Release assets and removes a raw Draft Release input asset;
+5. uploads the six validated Release assets and removes a raw Draft Release input asset;
 6. publishes the Release, posts success, closes the upload Issue, and dispatches **submit next tag** once for the next registered delivery.
 
 Only one tag may be `starting` or `running`. Later tags retain their own Draft Releases and locked Issues but are not submitted until the active tag publishes successfully.
@@ -56,7 +56,6 @@ Each published Release contains exactly:
 - `signlang_det_encoder.pt`;
 - `signlang_det_encoder.onnx`;
 - `signlang_det_encoder.rknn`;
-- `signlang_det_encoder.int8.rknn`;
 - `model-manifest.json`;
 - `signlang_det_kaggle_training.ipynb` from the tagged commit;
 - `notebook-output.tar.gz` containing the remaining validated notebook outputs.
