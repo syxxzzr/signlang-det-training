@@ -67,7 +67,7 @@ Watch the linked Kaggle page manually. A Kaggle error, timeout, or cancellation 
 
 If Kaggle submission itself fails, run **Kaggle CD - submit next tag** from the default branch with `retry_tag` set to the failed tag. It requeues only a Draft Release already marked `failed`. A running delivery is never polled by this workflow.
 
-GitHub may expose a Draft Release with a generated `untagged-<20 hex>` placeholder even though the queue body still records its registered Git tag. The coordinator ignores that placeholder and verifies the registered tag against the locked commit before uploading; other Release tag edits continue to repair stale queue metadata.
+GitHub may expose a Draft Release with a generated `untagged-<20 hex>` placeholder even though the queue body still records its registered Git tag. The coordinator preserves the queued identity, migrates placeholder state persisted by older coordinator versions, restores the Draft Release's registered tag before any tag-addressed operation, and verifies that tag against the locked commit before both Kaggle submission and final Release asset upload. It also verifies the published Release response. Tags matching GitHub's reserved placeholder format cannot be registered. Other Release tag edits continue to repair stale queue metadata.
 
 If an uploaded ZIP fails validation or conversion, inspect the bot's failure comment and add a corrected attachment or `/convert` command. Do not edit an old candidate: new comments provide stable FIFO identity and trigger the workflow. The Issue closes only after Release publication succeeds.
 

@@ -104,6 +104,20 @@ def parse_bool(value: str) -> bool:
     raise ValueError(f"Expected a boolean value, received {value!r}")
 
 
+def is_synthetic_release_tag(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and GITHUB_UNTAGGED_RELEASE_PATTERN.fullmatch(value) is not None
+    )
+
+
+def require_registered_tag(tag: str) -> None:
+    if is_synthetic_release_tag(tag):
+        raise RuntimeError(
+            f"Tag {tag!r} uses GitHub's reserved Draft Release placeholder format"
+        )
+
+
 def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
     if not release.get("draft"):
         return None
@@ -123,6 +137,25 @@ def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
             return None
     if not isinstance(state, dict) or state.get("schema") != STATE_SCHEMA:
         return None
+    state_tag = state.get("tag")
+    if is_synthetic_release_tag(state_tag):
+        recovered_tag = state.get("tag_recovered_from")
+        if (
+            not isinstance(recovered_tag, str)
+            or not recovered_tag
+            or is_synthetic_release_tag(recovered_tag)
+        ):
+            raise RuntimeError(
+                f"CD release {release.get('id')} has synthetic queued tag "
+                f"{state_tag!r} without a valid recovery tag"
+            )
+        print(
+            f"::warning::Recovering CD release {release.get('id')} queued tag "
+            f"from persisted placeholder {state_tag!r} to {recovered_tag!r}",
+            file=sys.stderr,
+        )
+        state["synthetic_tag_recovered_from"] = state_tag
+        state["tag"] = recovered_tag
     release_tag = release.get("tag_name")
     if not isinstance(release_tag, str) or not release_tag:
         raise RuntimeError(f"CD release {release.get('id')} has no tag_name")
@@ -131,7 +164,7 @@ def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
         if (
             isinstance(previous_tag, str)
             and previous_tag
-            and GITHUB_UNTAGGED_RELEASE_PATTERN.fullmatch(release_tag)
+            and is_synthetic_release_tag(release_tag)
         ):
             print(
                 f"::warning::Ignoring synthetic tag {release_tag!r} for CD release "
@@ -147,6 +180,18 @@ def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
         state["tag_recovered_from"] = previous_tag
         state["tag"] = release_tag
     return state
+
+
+def release_matches_tag(release: Mapping[str, Any], tag: str) -> bool:
+    if release.get("tag_name") == tag:
+        return True
+    if (
+        not release.get("draft")
+        or not is_synthetic_release_tag(release.get("tag_name"))
+    ):
+        return False
+    state = parse_release_state(release)
+    return state is not None and state.get("tag") == tag
 
 
 def render_release_body(state: Mapping[str, Any]) -> str:
@@ -566,7 +611,8 @@ class GitHubClient:
         })
 
     def create_queue_release(self, tag: str, git_sha: str) -> dict[str, Any]:
-        if any(release.get("tag_name") == tag for release in self.list_releases()):
+        require_registered_tag(tag)
+        if any(release_matches_tag(release, tag) for release in self.list_releases()):
             raise RuntimeError(f"A GitHub release already exists for tag {tag}")
         state = {
             "schema": STATE_SCHEMA,
@@ -592,12 +638,14 @@ class GitHubClient:
         return self.request("PATCH", f"/releases/{release_id}", {
             "body": render_release_body(payload),
             "name": release_name(payload),
+            "tag_name": str(payload["tag"]),
         })
 
     def publish(self, release_id: int, tag: str, body: str) -> dict[str, Any]:
         return self.request("PATCH", f"/releases/{release_id}", {
             "name": tag,
             "body": body,
+            "tag_name": tag,
             "draft": False,
             "prerelease": False,
         })
@@ -738,11 +786,41 @@ def state_for_release(release: Mapping[str, Any]) -> dict[str, Any]:
     return state
 
 
-def stage_upload(state: Mapping[str, Any], config: Config, folder: Path) -> None:
+def restore_synthetic_release_tag(
+    github: GitHubClient,
+    release: Mapping[str, Any],
+    state: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    expected_tag = str(state["tag"])
+    if release.get("tag_name") == expected_tag:
+        return release
+    if (
+        not release.get("draft")
+        or not is_synthetic_release_tag(release.get("tag_name"))
+    ):
+        raise RuntimeError(
+            f"Refusing to restore non-placeholder Release tag "
+            f"{release.get('tag_name')!r} to {expected_tag!r}"
+        )
+    updated = github.update_state(int(release["id"]), state)
+    if updated.get("tag_name") != expected_tag:
+        raise RuntimeError(
+            f"Could not restore Release {release.get('id')} tag: "
+            f"expected {expected_tag!r}, received {updated.get('tag_name')!r}"
+        )
+    return updated
+
+
+def verify_tag_commit(state: Mapping[str, Any]) -> None:
     tag, git_sha = str(state["tag"]), str(state["git_sha"])
     resolved = run(["git", "rev-parse", f"{tag}^{{commit}}"])
     if resolved.strip() != git_sha:
         raise RuntimeError(f"Tag {tag} resolves to {resolved.strip()}, expected {git_sha}")
+
+
+def stage_upload(state: Mapping[str, Any], config: Config, folder: Path) -> None:
+    git_sha = str(state["git_sha"])
+    verify_tag_commit(state)
     notebook_text = subprocess.check_output(["git", "show", f"{git_sha}:{NOTEBOOK_PATH}"], text=True)
     folder.mkdir(parents=True, exist_ok=True)
     (folder / NOTEBOOK_PATH).write_text(notebook_text, encoding="utf-8")
@@ -1423,6 +1501,8 @@ def publish_handoff_directory(handoff_dir: Path) -> str:
     asset_dir = handoff_dir / "assets"
     assets = validate_release_assets(asset_dir, metadata)
     staged_assets = github.list_release_assets(int(release["id"]))
+    verify_tag_commit(state)
+    release = restore_synthetic_release_tag(github, release, current)
     github.upload_assets(str(state["tag"]), assets)
     for staged_asset in staged_assets:
         github.delete_release_asset(int(staged_asset["id"]), missing_ok=True)
@@ -1436,7 +1516,12 @@ def publish_handoff_directory(handoff_dir: Path) -> str:
         "PT, ONNX, non-quantized RKNN, INT8 RKNN, the model manifest, the tagged notebook, "
         "and remaining notebook outputs are attached as seven Release assets.\n"
     )
-    github.publish(int(release["id"]), str(state["tag"]), body)
+    published = github.publish(int(release["id"]), str(state["tag"]), body)
+    if published.get("draft") or published.get("tag_name") != str(state["tag"]):
+        raise RuntimeError(
+            f"Published Release identity mismatch: draft={published.get('draft')!r}, "
+            f"tag={published.get('tag_name')!r}"
+        )
     print(f"Published GitHub release {state['tag']}")
     return str(state["tag"])
 
@@ -1499,7 +1584,13 @@ def issue_release_context(
         raise RuntimeError(f"Kaggle CD upload Issue #{issue_number} must remain locked")
     binding = parse_issue_binding(issue)
     release = github.get_release(int(binding["release_id"]))
-    if str(binding["tag"]) != str(release.get("tag_name")):
+    release_tag_mismatch = str(binding["tag"]) != str(release.get("tag_name"))
+    placeholder_mismatch = (
+        release_tag_mismatch
+        and release.get("draft")
+        and is_synthetic_release_tag(release.get("tag_name"))
+    )
+    if release_tag_mismatch and not placeholder_mismatch:
         raise RuntimeError(
             f"Issue #{issue_number} no longer matches Release tag {release.get('tag_name')!r}"
         )
@@ -1513,6 +1604,8 @@ def issue_release_context(
                 f"Issue #{issue_number} no longer matches Draft Release state: "
                 f"{state_mismatched or ['issue_number']}"
             )
+        if placeholder_mismatch:
+            release = restore_synthetic_release_tag(github, release, state)
     return issue, binding, release
 
 
@@ -1648,9 +1741,13 @@ def probe(_: argparse.Namespace) -> None:
 
 
 def retry(args: argparse.Namespace) -> None:
+    require_registered_tag(args.tag)
     config = Config.from_env(require_kaggle=False)
     github = GitHubClient(config)
-    matches = [release for release in github.list_releases() if release.get("tag_name") == args.tag]
+    matches = [
+        release for release in github.list_releases()
+        if release_matches_tag(release, args.tag)
+    ]
     if len(matches) != 1:
         raise RuntimeError(f"Expected one release for {args.tag}, found {len(matches)}")
     release = matches[0]
