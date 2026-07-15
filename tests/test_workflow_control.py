@@ -32,8 +32,14 @@ class WorkflowControlTests(unittest.TestCase):
     def test_issue_workflow_requires_a_locked_upload_issue(self):
         self.assertIn("issue_comment:\n", self.issue)
         self.assertIn("github.event.issue.locked", self.issue)
+        self.assertIn("github.event.comment.user.type != 'Bot'", self.issue)
         self.assertIn("Kaggle output upload · ", self.issue)
         self.assertNotIn("comment.user.login", self.issue)
+        self.assertIn("if: ${{ always() }}", self.issue)
+        self.assertIn(
+            'gh api --method PUT "repos/$GH_REPO/issues/$ISSUE_NUMBER/lock"',
+            self.issue,
+        )
 
     def test_issue_workflow_drains_then_starts_next_tag(self):
         drain = "python .github/scripts/kaggle_cd.py process-issue"

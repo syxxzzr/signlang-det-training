@@ -34,7 +34,8 @@ class IssueQueueTests(unittest.TestCase):
             {
                 "id": 20,
                 "created_at": "2026-07-14T01:00:00Z",
-                "user": {"type": "User"},
+                "user": {"type": "User", "login": "writer"},
+                "author_association": "COLLABORATOR",
                 "body": f"Attached: [model output]({attachment})\n/convert output package (final)",
             },
             {
@@ -53,11 +54,56 @@ class IssueQueueTests(unittest.TestCase):
         )
         self.assertEqual(candidates[-1].source, "output package (final)")
 
+    def test_untrusted_comment_during_unlock_window_is_ignored(self):
+        comments = [{
+            "id": 22,
+            "created_at": "2026-07-14T01:02:00Z",
+            "user": {"type": "User", "login": "outsider"},
+            "author_association": "NONE",
+            "body": "/convert untrusted asset",
+        }]
+
+        self.assertEqual(self.module.issue_candidates(comments), [])
+
+    def test_candidate_requires_write_permission(self):
+        comments = [{
+            "id": 23,
+            "created_at": "2026-07-14T01:03:00Z",
+            "user": {"type": "User", "login": "org-reader"},
+            "author_association": "MEMBER",
+            "body": "/convert member asset",
+        }]
+        github = SimpleNamespace(collaborator_permission=lambda login: "read")
+
+        self.assertEqual(self.module.authorized_issue_candidates(github, comments), [])
+
+    def test_missing_collaborator_has_no_candidate_permission(self):
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        client = self.module.GitHubClient(config)
+
+        def missing_permission(*args, **kwargs):
+            raise RuntimeError("GitHub API failed: HTTP 404: not found")
+
+        client.request = missing_permission
+
+        self.assertEqual(client.collaborator_permission("former-writer"), "")
+
     def test_only_bot_terminal_markers_dequeue_candidates(self):
         marker = "<!-- signlang-kaggle-cd-attempt:42:0:failed -->"
         comments = [
             {"body": marker, "user": {"type": "User"}},
-            {"body": marker, "user": {"type": "Bot"}},
+            {"body": marker, "user": {"type": "Bot", "login": "other-app[bot]"}},
+            {
+                "body": marker,
+                "user": {"type": "Bot", "login": "github-actions[bot]"},
+            },
         ]
         self.assertEqual(self.module.terminal_attempts(comments), {"42:0": "failed"})
 
@@ -85,6 +131,60 @@ class IssueQueueTests(unittest.TestCase):
 
         self.assertEqual(issue["number"], 17)
         self.assertEqual(calls[-1], ("PUT", "/issues/17/lock", None))
+
+    def test_bot_comment_temporarily_unlocks_and_relocks_issue(self):
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        client = self.module.GitHubClient(config)
+        calls = []
+
+        def fake_request(method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "POST":
+                return {"id": 42, "body": payload["body"]}
+            return None
+
+        client.request = fake_request
+
+        comment = client.create_locked_issue_comment(19, "processing")
+
+        self.assertEqual(comment["id"], 42)
+        self.assertEqual(calls, [
+            ("DELETE", "/issues/19/lock", None),
+            ("POST", "/issues/19/comments", {"body": "processing"}),
+            ("PUT", "/issues/19/lock", None),
+        ])
+
+    def test_bot_comment_relocks_issue_when_comment_creation_fails(self):
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        client = self.module.GitHubClient(config)
+        calls = []
+
+        def fake_request(method, path, payload=None):
+            calls.append((method, path, payload))
+            if method == "POST":
+                raise RuntimeError("comment failed")
+            return None
+
+        client.request = fake_request
+
+        with self.assertRaisesRegex(RuntimeError, "comment failed"):
+            client.create_locked_issue_comment(19, "failure")
+
+        self.assertEqual(calls[-1], ("PUT", "/issues/19/lock", None))
 
     def test_delivery_issue_is_bilingual_and_explains_both_handoffs(self):
         release = {"id": 9, "html_url": "https://example.invalid/release"}
@@ -134,13 +234,15 @@ class IssueQueueTests(unittest.TestCase):
             {
                 "id": 100,
                 "created_at": "2026-07-14T01:00:00Z",
-                "user": {"type": "User"},
+                "user": {"type": "User", "login": "writer"},
+                "author_association": "COLLABORATOR",
                 "body": "/convert first candidate",
             },
             {
                 "id": 101,
                 "created_at": "2026-07-14T01:01:00Z",
-                "user": {"type": "User"},
+                "user": {"type": "User", "login": "writer"},
+                "author_association": "COLLABORATOR",
                 "body": "/convert second candidate",
             },
         ]
@@ -156,11 +258,14 @@ class IssueQueueTests(unittest.TestCase):
             def list_issue_comments(self, number):
                 return list(comments)
 
-            def create_issue_comment(self, number, body):
+            def collaborator_permission(self, username):
+                return "write"
+
+            def create_locked_issue_comment(self, number, body):
                 comments.append({
                     "id": 1000 + len(comments),
                     "created_at": "2026-07-14T02:00:00Z",
-                    "user": {"type": "Bot"},
+                    "user": {"type": "Bot", "login": "github-actions[bot]"},
                     "body": body,
                 })
 
