@@ -250,6 +250,18 @@ class ReleaseStateTests(unittest.TestCase):
 
         self.assertEqual(parsed["tag"], "v0.0.1-Alpha")
         self.assertNotIn("tag_recovered_from", parsed)
+        self.assertTrue(
+            self.module.release_matches_tag(
+                self.release(state, "untagged-b6af7d978bf098ad8043"),
+                "v0.0.1-Alpha",
+            )
+        )
+        self.assertFalse(
+            self.module.release_matches_tag(
+                self.release(state, "untagged-b6af7d978bf098ad8043"),
+                "v0.0.2",
+            )
+        )
 
         config = SimpleNamespace(
             kaggle_username="owner",
@@ -279,6 +291,277 @@ class ReleaseStateTests(unittest.TestCase):
 
         self.assertEqual(parsed["tag"], "v0.0.2")
         self.assertEqual(parsed["tag_recovered_from"], "v0.0.1-Alpha")
+
+    def test_persisted_synthetic_state_recovers_original_tag(self):
+        placeholder = "untagged-b6af7d978bf098ad8043"
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "failed",
+            "tag": placeholder,
+            "tag_recovered_from": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+        }
+
+        parsed = self.module.parse_release_state(self.release(state, placeholder))
+
+        self.assertEqual(parsed["tag"], "v0.0.1-Alpha")
+        self.assertEqual(parsed["synthetic_tag_recovered_from"], placeholder)
+
+    def test_persisted_synthetic_state_without_original_tag_fails_closed(self):
+        placeholder = "untagged-b6af7d978bf098ad8043"
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "failed",
+            "tag": placeholder,
+            "git_sha": "a" * 40,
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "without a valid recovery tag"):
+            self.module.parse_release_state(self.release(state, placeholder))
+
+    def test_reserved_placeholder_format_cannot_be_registered_or_retried(self):
+        placeholder = "untagged-b6af7d978bf098ad8043"
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        client = self.module.GitHubClient(config)
+
+        with self.assertRaisesRegex(RuntimeError, "reserved Draft Release placeholder"):
+            client.create_queue_release(placeholder, "a" * 40)
+        with self.assertRaisesRegex(RuntimeError, "reserved Draft Release placeholder"):
+            self.module.retry(SimpleNamespace(tag=placeholder))
+
+    def test_issue_context_restores_synthetic_draft_release_tag(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "running",
+            "tag": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+            "issue_number": 19,
+        }
+        release = {
+            "id": 9,
+            "draft": True,
+            "tag_name": "untagged-b9b033178acf4e9f7a1c",
+            "html_url": "https://example.invalid/release/9",
+            "body": self.module.render_release_body(state),
+        }
+        issue = {
+            "number": 19,
+            "locked": True,
+            "body": self.module.render_delivery_issue(release, state),
+        }
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        client = self.module.GitHubClient(config)
+        patches = []
+
+        def fake_request(method, path, payload=None):
+            if (method, path) == ("GET", "/issues/19"):
+                return issue
+            if (method, path) == ("GET", "/releases/9"):
+                return release
+            if (method, path) == ("PATCH", "/releases/9"):
+                patches.append(payload)
+                return {**release, **payload}
+            raise AssertionError(f"Unexpected request: {method} {path}")
+
+        client.request = fake_request
+
+        _, binding, repaired = self.module.issue_release_context(client, 19)
+
+        self.assertEqual(binding["tag"], "v0.0.1-Alpha")
+        self.assertEqual(repaired["tag_name"], "v0.0.1-Alpha")
+        self.assertEqual(patches[0]["tag_name"], "v0.0.1-Alpha")
+
+    def test_issue_context_rejects_non_placeholder_tag_mismatch(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "running",
+            "tag": "v1",
+            "git_sha": "a" * 40,
+            "issue_number": 19,
+        }
+        bound_release = {
+            "id": 9,
+            "html_url": "https://example.invalid/release/9",
+        }
+        issue = {
+            "number": 19,
+            "locked": True,
+            "body": self.module.render_delivery_issue(bound_release, state),
+        }
+        changed_release = {
+            **bound_release,
+            "draft": True,
+            "tag_name": "v2",
+            "body": self.module.render_release_body(state),
+        }
+        github = SimpleNamespace(
+            get_issue=lambda number: issue,
+            get_release=lambda release_id: changed_release,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "no longer matches Release tag 'v2'"):
+            self.module.issue_release_context(github, 19)
+
+    def test_standalone_publish_restores_tag_before_asset_upload(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "running",
+            "tag": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+            "kaggle_kernel": "owner/kernel",
+            "kaggle_version": 3,
+            "kaggle_url": "https://example.invalid/kernel",
+            "rknn_target_platform": "rk3588",
+        }
+        metadata = {
+            "repository": "owner/repository",
+            "release_id": 9,
+            "kaggle_kernel": "owner/kernel",
+            "rknn_target_platform": "rk3588",
+            "state": state,
+        }
+        release = {
+            "id": 9,
+            "draft": True,
+            "tag_name": "untagged-b9b033178acf4e9f7a1c",
+            "body": self.module.render_release_body(state),
+        }
+        events = []
+
+        class FakeGitHub:
+            def get_release(self, release_id):
+                return release
+
+            def list_release_assets(self, release_id):
+                events.append("list-assets")
+                return []
+
+            def update_state(self, release_id, current):
+                events.append("restore-tag")
+                return {**release, "tag_name": current["tag"]}
+
+            def upload_assets(self, tag, assets):
+                events.append("upload-assets")
+                self.assertion_tag = tag
+
+            def delete_release_asset(self, asset_id, missing_ok=False):
+                raise AssertionError("No staged assets should be deleted")
+
+            def publish(self, release_id, tag, body):
+                events.append("publish")
+                return {"draft": False, "tag_name": tag}
+
+        github = FakeGitHub()
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        with (
+            mock.patch.object(self.module, "load_handoff", return_value=metadata),
+            mock.patch.object(self.module.Config, "from_env", return_value=config),
+            mock.patch.object(self.module, "GitHubClient", return_value=github),
+            mock.patch.object(
+                self.module,
+                "validate_release_assets",
+                return_value=[Path("validated-asset")],
+            ),
+            mock.patch.object(
+                self.module,
+                "verify_tag_commit",
+                side_effect=lambda state: events.append("verify-tag"),
+            ),
+        ):
+            published_tag = self.module.publish_handoff_directory(Path("unused"))
+
+        self.assertEqual(published_tag, "v0.0.1-Alpha")
+        self.assertEqual(github.assertion_tag, "v0.0.1-Alpha")
+        self.assertEqual(
+            events,
+            [
+                "list-assets",
+                "verify-tag",
+                "restore-tag",
+                "upload-assets",
+                "publish",
+            ],
+        )
+
+    def test_duplicate_registration_finds_placeholder_backed_release(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "queued",
+            "tag": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+        }
+        existing = self.release(state, "untagged-b9b033178acf4e9f7a1c")
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        client = self.module.GitHubClient(config)
+        client.list_releases = lambda: [existing]
+
+        with self.assertRaisesRegex(RuntimeError, "already exists for tag v0.0.1-Alpha"):
+            client.create_queue_release("v0.0.1-Alpha", "a" * 40)
+
+    def test_retry_finds_placeholder_backed_release_and_restores_tag(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "failed",
+            "tag": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+            "failure": "transient failure",
+        }
+        release = self.release(state, "untagged-b9b033178acf4e9f7a1c")
+        updates = []
+
+        class FakeGitHub:
+            def list_releases(self):
+                return [release]
+
+            def update_state(self, release_id, current):
+                updates.append(dict(current))
+                return {**release, "tag_name": current["tag"]}
+
+        config = self.module.Config(
+            repository="owner/repository",
+            github_token="token",
+            kaggle_username="",
+            kernel_slug="kernel",
+            kernel_private=True,
+            rknn_target_platform="rk3588",
+        )
+        with (
+            mock.patch.object(self.module.Config, "from_env", return_value=config),
+            mock.patch.object(self.module, "GitHubClient", return_value=FakeGitHub()),
+        ):
+            self.module.retry(SimpleNamespace(tag="v0.0.1-Alpha"))
+
+        self.assertEqual(updates[0]["tag"], "v0.0.1-Alpha")
+        self.assertEqual(updates[0]["state"], "queued")
+        self.assertIsNone(updates[0]["failure"])
 
 
 class UploadedZipTests(unittest.TestCase):
