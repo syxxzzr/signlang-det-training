@@ -51,6 +51,8 @@ ATTEMPT_STATUS_PATTERN = re.compile(
     rf"<!-- {re.escape(ATTEMPT_MARKER)}(?P<id>\d+:\d+):(?P<status>failed|succeeded) -->"
 )
 GITHUB_UNTAGGED_RELEASE_PATTERN = re.compile(r"untagged-[0-9a-f]{20}", re.IGNORECASE)
+TRUSTED_ISSUE_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
+STATUS_BOT_LOGIN = "github-actions[bot]"
 NOTEBOOK_OUTPUT_FILES = (
     "signlang_det_encoder.pt",
     "int8_calibration.tar.gz",
@@ -372,6 +374,7 @@ def parse_issue_binding(issue: Mapping[str, Any]) -> dict[str, Any]:
 class ConversionCandidate:
     candidate_id: str
     comment_id: int
+    author_login: str
     source_kind: str
     source: str
 
@@ -381,6 +384,11 @@ def issue_candidates(comments: Iterable[Mapping[str, Any]]) -> list[ConversionCa
     for comment in comments:
         user = comment.get("user") or {}
         if str(user.get("type", "")).lower() == "bot":
+            continue
+        if (
+            str(comment.get("author_association", "")).upper()
+            not in TRUSTED_ISSUE_ASSOCIATIONS
+        ):
             continue
         body = str(comment.get("body") or "")
         comment_id = int(comment["id"])
@@ -400,18 +408,43 @@ def issue_candidates(comments: Iterable[Mapping[str, Any]]) -> list[ConversionCa
             candidate = ConversionCandidate(
                 candidate_id=candidate_id,
                 comment_id=comment_id,
+                author_login=str(user.get("login") or ""),
                 source_kind=source_kind,
                 source=source,
             )
-            candidates.append((str(comment.get("created_at") or ""), comment_id, position, candidate))
+            candidates.append((
+                str(comment.get("created_at") or ""), comment_id, position, candidate
+            ))
     return [item[-1] for item in sorted(candidates, key=lambda item: item[:-1])]
+
+
+def authorized_issue_candidates(
+    github: GitHubClient,
+    comments: Iterable[Mapping[str, Any]],
+    permissions: Optional[dict[str, str]] = None,
+) -> list[ConversionCandidate]:
+    permission_cache = permissions if permissions is not None else {}
+    authorized = []
+    for candidate in issue_candidates(comments):
+        if not candidate.author_login:
+            continue
+        permission = permission_cache.get(candidate.author_login)
+        if permission is None:
+            permission = github.collaborator_permission(candidate.author_login)
+            permission_cache[candidate.author_login] = permission
+        if permission in {"admin", "maintain", "write"}:
+            authorized.append(candidate)
+    return authorized
 
 
 def terminal_attempts(comments: Iterable[Mapping[str, Any]]) -> dict[str, str]:
     statuses: dict[str, str] = {}
     for comment in comments:
         user = comment.get("user") or {}
-        if str(user.get("type", "")).lower() != "bot":
+        if (
+            str(user.get("type", "")).lower() != "bot"
+            or str(user.get("login", "")).lower() != STATUS_BOT_LOGIN
+        ):
             continue
         for match in ATTEMPT_STATUS_PATTERN.finditer(str(comment.get("body") or "")):
             statuses[match.group("id")] = match.group("status")
@@ -571,6 +604,16 @@ class GitHubClient:
     def get_issue(self, issue_number: int) -> dict[str, Any]:
         return self.request("GET", f"/issues/{issue_number}")
 
+    def collaborator_permission(self, username: str) -> str:
+        encoded = urllib.parse.quote(username, safe="")
+        try:
+            response = self.request("GET", f"/collaborators/{encoded}/permission")
+        except RuntimeError as exc:
+            if "HTTP 404:" in str(exc):
+                return ""
+            raise
+        return str(response.get("permission") or "").lower()
+
     def list_issue_comments(self, issue_number: int) -> list[dict[str, Any]]:
         comments, page = [], 1
         while True:
@@ -585,6 +628,19 @@ class GitHubClient:
     def create_issue_comment(self, issue_number: int, body: str) -> dict[str, Any]:
         return self.request("POST", f"/issues/{issue_number}/comments", {"body": body})
 
+    def lock_issue(self, issue_number: int) -> None:
+        self.request("PUT", f"/issues/{issue_number}/lock")
+
+    def unlock_issue(self, issue_number: int) -> None:
+        self.request("DELETE", f"/issues/{issue_number}/lock")
+
+    def create_locked_issue_comment(self, issue_number: int, body: str) -> dict[str, Any]:
+        self.unlock_issue(issue_number)
+        try:
+            return self.create_issue_comment(issue_number, body)
+        finally:
+            self.lock_issue(issue_number)
+
     def close_issue(self, issue_number: int) -> dict[str, Any]:
         return self.request(
             "PATCH", f"/issues/{issue_number}", {"state": "closed", "state_reason": "completed"}
@@ -597,7 +653,7 @@ class GitHubClient:
             "title": f"Kaggle output upload · {state['tag']}",
             "body": render_delivery_issue(release, state),
         })
-        self.request("PUT", f"/issues/{int(issue['number'])}/lock")
+        self.lock_issue(int(issue["number"]))
         return issue
 
     def update_delivery_issue(
@@ -1632,6 +1688,7 @@ def process_issue(args: argparse.Namespace) -> None:
     github = GitHubClient(config)
     issue_number = int(args.issue_number)
     processed = 0
+    permission_cache: dict[str, str] = {}
 
     issue, _, release = issue_release_context(github, issue_number)
     if close_published_issue(github, issue, release):
@@ -1647,14 +1704,16 @@ def process_issue(args: argparse.Namespace) -> None:
         comments = github.list_issue_comments(issue_number)
         completed = terminal_attempts(comments)
         pending = [
-            candidate for candidate in issue_candidates(comments)
+            candidate for candidate in authorized_issue_candidates(
+                github, comments, permission_cache
+            )
             if candidate.candidate_id not in completed
         ]
         if not pending:
             write_process_outputs(args.github_output, published=False, processed=processed)
             return
         candidate = pending[0]
-        github.create_issue_comment(
+        github.create_locked_issue_comment(
             issue_number, candidate_comment(candidate, "processing")
         )
         processed += 1
@@ -1686,7 +1745,7 @@ def process_issue(args: argparse.Namespace) -> None:
                     handoff_dir=handoff_dir, output_dir=converted_dir
                 ))
                 publish_handoff_directory(converted_dir)
-            github.create_issue_comment(
+            github.create_locked_issue_comment(
                 issue_number,
                 candidate_comment(
                     candidate,
@@ -1703,7 +1762,7 @@ def process_issue(args: argparse.Namespace) -> None:
             if close_published_issue(github, latest_issue, latest_release):
                 write_process_outputs(args.github_output, published=True, processed=processed)
                 return
-            github.create_issue_comment(
+            github.create_locked_issue_comment(
                 issue_number,
                 candidate_comment(candidate, "failed", f"{type(exc).__name__}: {exc}"),
             )

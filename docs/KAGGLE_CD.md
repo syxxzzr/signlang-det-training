@@ -27,7 +27,7 @@ Kaggle metadata requests an `NvidiaTeslaT4`, enables GPU execution, and attaches
 Pushing a Git tag performs the following steps:
 
 1. **Kaggle CD - register tag** registers the tagged delivery as a Draft Release and creates its matching upload Issue.
-2. The upload Issue is locked immediately. GitHub still lets repository writers comment on a locked conversation; no per-user allowlist is applied.
+2. The upload Issue is locked immediately. Candidate comments are accepted only when GitHub reports the author as the repository owner, an organization member, or a collaborator and the repository permission API confirms `write`, `maintain`, or `admin` access.
 3. **Kaggle CD - submit next tag** submits the exact tagged notebook to Kaggle and records the returned kernel, numeric version, target platform, and upload Issue in the Draft Release.
 4. GitHub Actions stops. It does not poll Kaggle or keep a runner waiting.
 
@@ -38,7 +38,7 @@ After training completes, download the Kaggle output ZIP and submit it through t
 
 The filename and extension are unrestricted. GitHub's own Issue attachment size limit still applies to direct attachments; use a Draft Release asset for a larger file. The downloaded content must be a valid ZIP containing exactly the expected notebook output tree.
 
-Every attachment and every `/convert` command is a durable queue candidate. **Kaggle CD - convert Issue uploads** scans the complete comment history and processes unhandled candidates in comment order. A failed candidate receives a terminal failure comment and the workflow continues to the next queued candidate. If no candidate succeeds, the Issue remains open and another upload or command starts a new drain. Processing markers are non-terminal, so an interrupted workflow retries rather than losing a candidate.
+Every trusted attachment and every trusted `/convert` command is a durable queue candidate. **Kaggle CD - convert Issue uploads** scans the complete comment history and processes unhandled candidates in comment order. To post bot status comments, the coordinator briefly unlocks the Issue and immediately relocks it; an `always()` workflow step provides a final relock safeguard. Comments from users outside the repository are ignored even if they arrive during that short window. A failed candidate receives a terminal failure comment and the workflow continues to the next queued candidate. If no candidate succeeds, the Issue remains open and another upload or command starts a new drain. Processing markers are non-terminal, so an interrupted workflow retries rather than losing a candidate.
 
 The upload validator accepts only GitHub-hosted attachment or Release-asset downloads, caps compressed and expanded sizes and member count, rejects traversal, links, special files, encryption, duplicates, and unexpected output files, and determines ZIP validity from content instead of filename. Conversion then:
 

@@ -14,6 +14,7 @@ jobs:
   convert:
     if: >-
       ${{ !github.event.issue.pull_request && github.event.issue.locked &&
+          github.event.comment.user.type != 'Bot' &&
           startsWith(github.event.issue.title, 'Kaggle output upload · ') }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
@@ -54,6 +55,14 @@ jobs:
           python .github/scripts/kaggle_cd.py process-issue
           --issue-number "$ISSUE_NUMBER"
           --github-output "$GITHUB_OUTPUT"
+
+      - name: Ensure the upload Issue is locked
+        if: ${{ always() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ISSUE_NUMBER: ${{ github.event.issue.number }}
+        run: gh api --method PUT "repos/$GH_REPO/issues/$ISSUE_NUMBER/lock"
 
       - name: Start the next queued tag
         if: ${{ steps.drain.outputs.published == 'true' }}
