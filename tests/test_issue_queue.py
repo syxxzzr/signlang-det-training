@@ -63,7 +63,23 @@ class IssueQueueTests(unittest.TestCase):
             "body": "/convert untrusted asset",
         }]
 
-        self.assertEqual(self.module.issue_candidates(comments), [])
+        github = SimpleNamespace(collaborator_permission=lambda login: "")
+
+        self.assertEqual(self.module.authorized_issue_candidates(github, comments), [])
+
+    def test_write_permission_overrides_advisory_author_association(self):
+        comments = [{
+            "id": 24,
+            "created_at": "2026-07-14T01:04:00Z",
+            "user": {"type": "User", "login": "writer"},
+            "author_association": "NONE",
+            "body": "/convert valid asset",
+        }]
+        github = SimpleNamespace(collaborator_permission=lambda login: "write")
+
+        candidates = self.module.authorized_issue_candidates(github, comments)
+
+        self.assertEqual([candidate.source for candidate in candidates], ["valid asset"])
 
     def test_candidate_requires_write_permission(self):
         comments = [{
@@ -235,7 +251,7 @@ class IssueQueueTests(unittest.TestCase):
                 "id": 100,
                 "created_at": "2026-07-14T01:00:00Z",
                 "user": {"type": "User", "login": "writer"},
-                "author_association": "COLLABORATOR",
+                "author_association": "NONE",
                 "body": "/convert first candidate",
             },
             {
@@ -290,11 +306,20 @@ class IssueQueueTests(unittest.TestCase):
             "publish": self.module.publish_handoff_directory,
         }
 
+        converted = []
+
         def fake_download(github, current_release, candidate, destination):
             attempted.append(candidate.source)
-            if candidate.source == "first candidate":
-                raise self.module.TerminalDeliveryError("bad candidate")
             destination.write_bytes(b"valid archive placeholder")
+
+        def fake_prepare(*args, **kwargs):
+            if attempted[-1] == "first candidate":
+                raise self.module.TerminalDeliveryError(
+                    "Kaggle notebook output allowlist mismatch"
+                )
+
+        def fake_convert(*args, **kwargs):
+            converted.append(attempted[-1])
 
         def fake_publish(directory):
             release["draft"] = False
@@ -303,8 +328,8 @@ class IssueQueueTests(unittest.TestCase):
         self.module.Config.from_env = classmethod(lambda cls, **kwargs: config)
         self.module.GitHubClient = lambda current_config: fake_github
         self.module.download_candidate = fake_download
-        self.module.prepare_uploaded_handoff = lambda *args, **kwargs: None
-        self.module.convert_handoff = lambda *args, **kwargs: None
+        self.module.prepare_uploaded_handoff = fake_prepare
+        self.module.convert_handoff = fake_convert
         self.module.publish_handoff_directory = fake_publish
         try:
             with tempfile.TemporaryDirectory() as directory:
@@ -322,6 +347,7 @@ class IssueQueueTests(unittest.TestCase):
             self.module.publish_handoff_directory = originals["publish"]
 
         self.assertEqual(attempted, ["first candidate", "second candidate"])
+        self.assertEqual(converted, ["second candidate"])
         self.assertEqual(issue["state"], "closed")
         self.assertIn("published=true", outputs)
         self.assertTrue(any(":failed -->" in comment["body"] for comment in comments))
@@ -674,10 +700,11 @@ class UploadedZipTests(unittest.TestCase):
     def setUpClass(cls):
         cls.module = load_coordinator()
 
-    def write_expected_archive(self, archive: Path):
+    def write_expected_archive(self, archive: Path, prefix: str = "arbitrary-root"):
         with zipfile.ZipFile(archive, "w") as bundle:
             for relative in self.module.NOTEBOOK_OUTPUT_FILES:
-                bundle.writestr(f"arbitrary-root/{relative}", relative.encode())
+                path = f"{prefix}/{relative}" if prefix else relative
+                bundle.writestr(path, relative.encode())
 
     def test_valid_zip_needs_no_filename_extension(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -690,6 +717,35 @@ class UploadedZipTests(unittest.TestCase):
             detected = self.module.find_notebook_output_root(output)
 
             self.assertEqual(detected, output / "arbitrary-root")
+
+    def test_nested_output_accepts_kaggle_renderer_sidecars(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "upload"
+            output = root / "output"
+            self.write_expected_archive(archive, "signlang-det")
+            with zipfile.ZipFile(archive, "a") as bundle:
+                bundle.writestr("__results___files/__results___22_0.png", b"rendered")
+                bundle.writestr("__results___files/__results___22_1.png", b"rendered")
+
+            self.module.extract_uploaded_zip(archive, output)
+            detected = self.module.find_notebook_output_root(output)
+
+            self.assertEqual(detected, output / "signlang-det")
+
+    def test_flat_output_at_archive_root_is_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            archive = root / "upload"
+            output = root / "output"
+            self.write_expected_archive(archive, "")
+            with zipfile.ZipFile(archive, "a") as bundle:
+                bundle.writestr("__results___files/__results___22_0.png", b"rendered")
+
+            self.module.extract_uploaded_zip(archive, output)
+            detected = self.module.find_notebook_output_root(output)
+
+            self.assertEqual(detected, output)
 
     def test_zip_path_traversal_is_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
