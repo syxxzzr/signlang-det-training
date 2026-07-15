@@ -51,7 +51,6 @@ ATTEMPT_STATUS_PATTERN = re.compile(
     rf"<!-- {re.escape(ATTEMPT_MARKER)}(?P<id>\d+:\d+):(?P<status>failed|succeeded) -->"
 )
 GITHUB_UNTAGGED_RELEASE_PATTERN = re.compile(r"untagged-[0-9a-f]{20}", re.IGNORECASE)
-TRUSTED_ISSUE_ASSOCIATIONS = {"OWNER", "MEMBER", "COLLABORATOR"}
 STATUS_BOT_LOGIN = "github-actions[bot]"
 NOTEBOOK_OUTPUT_FILES = (
     "signlang_det_encoder.pt",
@@ -384,11 +383,6 @@ def issue_candidates(comments: Iterable[Mapping[str, Any]]) -> list[ConversionCa
     for comment in comments:
         user = comment.get("user") or {}
         if str(user.get("type", "")).lower() == "bot":
-            continue
-        if (
-            str(comment.get("author_association", "")).upper()
-            not in TRUSTED_ISSUE_ASSOCIATIONS
-        ):
             continue
         body = str(comment.get("body") or "")
         comment_id = int(comment["id"])
@@ -1049,9 +1043,16 @@ def start_job(github: GitHubClient, kaggle: KaggleClient, release: Mapping[str, 
     print(f"Pushed {state['tag']} as Kaggle version {pushed['version']}")
 
 
-def validate_notebook_outputs(output_root: Path) -> None:
+def validate_notebook_outputs(
+    output_root: Path, ignored_files: Iterable[Path] = ()
+) -> None:
     expected = {Path(relative) for relative in NOTEBOOK_OUTPUT_FILES}
-    actual = {path.relative_to(output_root) for path in output_root.rglob("*") if path.is_file()}
+    ignored = set(ignored_files)
+    actual = {
+        path.relative_to(output_root)
+        for path in output_root.rglob("*")
+        if path.is_file() and path not in ignored
+    }
     if actual != expected:
         missing = sorted(str(path) for path in expected - actual)
         unexpected = sorted(str(path) for path in actual - expected)
@@ -1061,15 +1062,23 @@ def validate_notebook_outputs(output_root: Path) -> None:
 
 
 def find_notebook_output_root(download_dir: Path) -> Path:
-    matches = [path.parent for path in download_dir.rglob("signlang_det_encoder.pt")]
+    files = {path for path in download_dir.rglob("*") if path.is_file()}
+    renderer_sidecars = {
+        path for path in files
+        if path.relative_to(download_dir).parts[0] == "__results___files"
+    }
+    matches = [
+        path.parent for path in files
+        if path.name == "signlang_det_encoder.pt" and path not in renderer_sidecars
+    ]
     if len(matches) != 1:
         raise TerminalDeliveryError(f"Expected one notebook output root, found {len(matches)}")
     output_root = matches[0]
-    validate_notebook_outputs(output_root)
+    validate_notebook_outputs(output_root, renderer_sidecars)
     outside = [
         str(path.relative_to(download_dir))
-        for path in download_dir.rglob("*")
-        if path.is_file() and not path.is_relative_to(output_root)
+        for path in files
+        if path not in renderer_sidecars and not path.is_relative_to(output_root)
     ]
     if outside:
         raise TerminalDeliveryError(
