@@ -1,4 +1,5 @@
 import importlib.util
+import inspect
 import json
 import sys
 import tempfile
@@ -6,6 +7,7 @@ import unittest
 from pathlib import Path
 from types import ModuleType
 from types import SimpleNamespace
+from unittest import mock
 
 
 class RknnBuildTests(unittest.TestCase):
@@ -57,74 +59,10 @@ class RknnBuildTests(unittest.TestCase):
                 else:
                     sys.modules[name] = original
 
-    def test_int8_build_enables_accuracy_guarded_auto_hybrid(self):
+    def test_build_uses_the_standard_rknn_configuration(self):
         calls = {}
-        expected = object()
 
-        class FakeRKNN:
-            def __init__(self, verbose=False):
-                calls["verbose"] = verbose
-
-            def config(self, **kwargs):
-                calls["config"] = kwargs
-                return 0
-
-            def load_onnx(self, **kwargs):
-                calls["load_onnx"] = kwargs
-                return 0
-
-            def build(self, **kwargs):
-                calls["build"] = kwargs
-                return 0
-
-            def export_rknn(self, path):
-                calls["export_rknn"] = path
-                return 0
-
-            def init_runtime(self):
-                return 0
-
-            def inference(self, inputs):
-                return [object()]
-
-            def release(self):
-                calls["released"] = True
-
-        original = self.module.RKNN
-        original_validator = self.module._validate_rknn_outputs
-        self.module.RKNN = FakeRKNN
-        self.module._validate_rknn_outputs = lambda *args: calls.update(validated=args)
-        try:
-            self.module._build_one_rknn(
-                Path("encoder.onnx"),
-                Path("encoder.int8.rknn"),
-                "rk3588",
-                Path("dataset.txt"),
-                [object()],
-                expected,
-            )
-        finally:
-            self.module.RKNN = original
-            self.module._validate_rknn_outputs = original_validator
-
-        self.assertEqual(
-            calls["config"],
-            {"target_platform": "rk3588", "auto_hybrid_cos_thresh": 0.99},
-        )
-        self.assertEqual(
-            calls["build"],
-            {
-                "do_quantization": True,
-                "dataset": "dataset.txt",
-                "auto_hybrid": True,
-            },
-        )
-        self.assertTrue(calls["released"])
-        self.assertTrue(calls["validated"][-1])
-        self.assertEqual(len(calls["validated"][2]), 1)
-
-    def test_fp_build_does_not_enable_hybrid_quantization(self):
-        calls = {}
+        self.assertTrue(hasattr(self.module, "_build_rknn"))
 
         class FakeRKNN:
             def __init__(self, verbose=False):
@@ -159,11 +97,10 @@ class RknnBuildTests(unittest.TestCase):
         self.module.RKNN = FakeRKNN
         self.module._validate_rknn_outputs = lambda *args: None
         try:
-            self.module._build_one_rknn(
+            self.module._build_rknn(
                 Path("encoder.onnx"),
                 Path("encoder.rknn"),
                 "rk3588",
-                None,
                 [object()],
                 object(),
             )
@@ -175,6 +112,70 @@ class RknnBuildTests(unittest.TestCase):
         self.assertEqual(calls["build"], {"do_quantization": False})
         self.assertEqual(len(calls["inference_inputs"]), 1)
         self.assertTrue(calls["released"])
+
+    def test_convert_creates_one_rknn_model(self):
+        calls = {}
+        self.assertEqual(
+            list(inspect.signature(self.module.convert).parameters),
+            ["pt_path", "output_dir", "target_platform"],
+        )
+        original_export = self.module.export_onnx
+        original_build = getattr(self.module, "build_rknn_model", None)
+        self.module.export_onnx = lambda pt, onnx: (
+            calls.update(export=(pt, onnx)) or ("landmarks", "expected")
+        )
+        self.module.build_rknn_model = lambda *args: calls.update(build=args)
+        try:
+            outputs = self.module.convert(
+                Path("encoder.pt"), Path("outputs"), "rk3588"
+            )
+        finally:
+            self.module.export_onnx = original_export
+            if original_build is None:
+                delattr(self.module, "build_rknn_model")
+            else:
+                self.module.build_rknn_model = original_build
+
+        self.assertEqual(
+            calls["export"],
+            (Path("encoder.pt"), Path("outputs/signlang_det_encoder.onnx")),
+        )
+        self.assertEqual(
+            calls["build"],
+            (
+                Path("outputs/signlang_det_encoder.onnx"),
+                Path("outputs/signlang_det_encoder.rknn"),
+                "rk3588",
+                ["landmarks"],
+                "expected",
+            ),
+        )
+        self.assertEqual(
+            outputs,
+            [
+                Path("outputs/signlang_det_encoder.onnx"),
+                Path("outputs/signlang_det_encoder.rknn"),
+            ],
+        )
+
+    def test_cli_requires_only_model_and_output_paths(self):
+        options = {
+            option
+            for action in self.module.parser()._actions
+            for option in action.option_strings
+        }
+        self.assertEqual(
+            options,
+            {
+                "-h",
+                "--help",
+                "--pt",
+                "--output-dir",
+                "--target-platform",
+                "--validate-only",
+                "--verify-rknn-only",
+            },
+        )
 
     def test_deployment_wrapper_derives_padding_mask_from_landmarks(self):
         calls = {}
@@ -245,7 +246,7 @@ class ModelManifestTests(unittest.TestCase):
         sys.modules[spec.name] = cls.module
         spec.loader.exec_module(cls.module)
 
-    def test_hybrid_int8_manifest_declares_float16_output(self):
+    def test_manifest_describes_the_three_published_models(self):
         payload = {
             "preprocessing": "hand168-temporal",
             "encoder_fingerprint": "fingerprint",
@@ -290,16 +291,105 @@ class ModelManifestTests(unittest.TestCase):
 
         pt_contract = manifest["models"]["signlang_det_encoder.pt"]["io_contract"]
         onnx_contract = manifest["models"]["signlang_det_encoder.onnx"]["io_contract"]
-        contract = manifest["models"]["signlang_det_encoder.int8.rknn"]["io_contract"]
-        landmarks = contract["inputs"]["landmarks"]
-        output = contract["outputs"]["frame_embeddings"]
+        rknn_contract = manifest["models"]["signlang_det_encoder.rknn"]["io_contract"]
         self.assertEqual(set(pt_contract["inputs"]), {"features", "lengths"})
         self.assertEqual(set(onnx_contract["inputs"]), {"landmarks"})
         self.assertEqual(onnx_contract["inputs"]["landmarks"]["dtype"], "float32")
-        self.assertEqual(landmarks["dtype"], "int8")
-        self.assertIn("quantization_parameters", landmarks)
-        self.assertEqual(output["dtype"], "float16")
-        self.assertNotIn("quantization_parameters", output)
+        self.assertEqual(rknn_contract, onnx_contract)
+        self.assertEqual(
+            set(manifest["models"]),
+            {
+                "signlang_det_encoder.pt",
+                "signlang_det_encoder.onnx",
+                "signlang_det_encoder.rknn",
+            },
+        )
+        self.assertTrue(all(
+            set(model) == {"format", "io_contract", "bytes", "sha256"}
+            for model in manifest["models"].values()
+        ))
+        self.assertEqual(
+            manifest["artifacts"],
+            {
+                "pytorch_weights": "signlang_det_encoder.pt",
+                "onnx_graph": "signlang_det_encoder.onnx",
+                "rknn_graph": "signlang_det_encoder.rknn",
+                "tokenizer": None,
+            },
+        )
+
+    def test_release_conversion_uses_the_model_only_cli(self):
+        state = {
+            "tag": "v-test",
+            "git_sha": "deadbeef",
+            "kaggle_kernel": "owner/kernel",
+            "kaggle_version": 1,
+            "kaggle_url": "https://example.invalid/kernel",
+            "rknn_target_platform": "rk3588",
+        }
+        commands = []
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            output_root = root / "output"
+            assets = root / "assets"
+            for name in self.module.NOTEBOOK_OUTPUT_FILES:
+                path = output_root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(name.encode())
+
+            def fake_check_output(command, text=False):
+                return "{}" if text else b"tagged converter"
+
+            def fake_run(command):
+                commands.append(command)
+                if "--validate-only" not in command and "--verify-rknn-only" not in command:
+                    output_dir = Path(command[command.index("--output-dir") + 1])
+                    for name in (
+                        "signlang_det_encoder.onnx",
+                        "signlang_det_encoder.rknn",
+                    ):
+                        (output_dir / name).write_bytes(name.encode())
+
+            def fake_manifest(pt_path, asset_dir, current_state, config, digest):
+                path = asset_dir / "model-manifest.json"
+                path.write_text("{}\n", encoding="utf-8")
+                return path
+
+            with (
+                mock.patch.object(self.module.subprocess, "check_output", fake_check_output),
+                mock.patch.object(self.module, "run", fake_run),
+                mock.patch.object(self.module, "create_model_manifest", fake_manifest),
+            ):
+                result = self.module.create_release_assets(
+                    output_root,
+                    assets,
+                    state,
+                    SimpleNamespace(rknn_target_platform="rk3588"),
+                )
+
+            current_converter = str(Path(self.module.__file__).with_name("convert_models.py"))
+            pt_path = str(assets / "signlang_det_encoder.pt")
+            output_dir = str(assets)
+            common = [
+                "--pt",
+                pt_path,
+                "--output-dir",
+                output_dir,
+                "--target-platform",
+                "rk3588",
+            ]
+            self.assertEqual(
+                commands[0],
+                [sys.executable, current_converter, *common, "--validate-only"],
+            )
+            self.assertEqual(commands[1][0], sys.executable)
+            self.assertEqual(commands[1][2:], common)
+            self.assertEqual(
+                commands[2],
+                [sys.executable, current_converter, *common, "--verify-rknn-only"],
+            )
+            self.assertEqual(len(result), 6)
 
 
 if __name__ == "__main__":

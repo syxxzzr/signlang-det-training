@@ -5,10 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import shutil
-import tarfile
-import tempfile
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Mapping, Optional, Sequence
 
 import numpy as np
@@ -25,16 +22,9 @@ except ImportError:  # Unit tests and PT/ONNX-only development do not require RK
 CHECKPOINT_SCHEMA = 1
 PREPROCESSING_CONTRACT = "hand168-temporal"
 FEATURE_SHAPE = (1, 64, 168)
-LENGTH_SHAPE = (1,)
 OUTPUT_SHAPE = (1, 64, 128)
 PADDING_VALUE = -100.0
 PADDING_DETECTION_THRESHOLD = -50.0
-CALIBRATION_MAX_SAMPLES = 100
-CALIBRATION_MAX_ARCHIVE_BYTES = 16 * 1024 * 1024
-CALIBRATION_MAX_MEMBER_BYTES = 1024 * 1024
-CALIBRATION_MAX_EXTRACTED_BYTES = 16 * 1024 * 1024
-CALIBRATION_MAX_MEMBERS = CALIBRATION_MAX_SAMPLES * 2 + 2
-RKNN_AUTO_HYBRID_COS_THRESHOLD = 0.99
 
 
 class TemporalBlock(nn.Module):
@@ -120,9 +110,8 @@ class DeploymentEncoder(nn.Module):
         self.encoder = encoder
 
     def forward(self, landmarks: torch.Tensor) -> torch.Tensor:
-        # RKNN INT8 input dequantization may not reproduce -100.0 bit-exactly.
-        # Conforming valid features are far above this midpoint, so the threshold
-        # preserves the external padding contract while remaining quantization-safe.
+        # A midpoint threshold preserves the external padding contract after
+        # conversion while conforming valid features remain far above it.
         padding_mask = torch.all(landmarks < PADDING_DETECTION_THRESHOLD, dim=-1)
         lengths = torch.sum(~padding_mask, dim=1).to(torch.int32)
         return self.encoder(landmarks, lengths)
@@ -260,102 +249,6 @@ def export_onnx(
     return landmarks.numpy(), actual
 
 
-def _safe_members(bundle: tarfile.TarFile) -> list[tarfile.TarInfo]:
-    members, seen, total_size = [], set(), 0
-    for member in bundle:
-        if len(members) >= CALIBRATION_MAX_MEMBERS:
-            raise ValueError(
-                f"Calibration archive contains more than {CALIBRATION_MAX_MEMBERS} members"
-            )
-        path = PurePosixPath(member.name)
-        allowed_name = (
-            path in {PurePosixPath("dataset.txt"), PurePosixPath("selection.csv")}
-            or (
-                len(path.parts) == 2
-                and path.parts[0] == "samples"
-                and path.suffix == ".npy"
-                and path.name.startswith(("features_", "lengths_"))
-            )
-        )
-        if (
-            path.is_absolute()
-            or ".." in path.parts
-            or not member.isfile()
-            or not allowed_name
-            or path in seen
-        ):
-            raise ValueError(f"Calibration archive contains an unsafe member: {member.name}")
-        if member.size < 0 or member.size > CALIBRATION_MAX_MEMBER_BYTES:
-            raise ValueError(f"Calibration archive member is too large: {member.name}")
-        seen.add(path)
-        total_size += member.size
-        members.append(member)
-    if total_size > CALIBRATION_MAX_EXTRACTED_BYTES:
-        raise ValueError("Calibration archive expands beyond the allowed size")
-    return members
-
-
-def prepare_calibration_dataset(archive: Path, destination: Path) -> Path:
-    if archive.stat().st_size > CALIBRATION_MAX_ARCHIVE_BYTES:
-        raise ValueError("Calibration archive is larger than the allowed compressed size")
-    if destination.exists():
-        shutil.rmtree(destination)
-    destination.mkdir(parents=True)
-    with tarfile.open(archive, "r:gz") as bundle:
-        bundle.extractall(destination, members=_safe_members(bundle))
-
-    source_list = destination / "dataset.txt"
-    if not source_list.is_file():
-        raise ValueError("Calibration archive does not contain dataset.txt")
-    resolved_lines, referenced = [], {Path("dataset.txt"), Path("selection.csv")}
-    for line_number, line in enumerate(source_list.read_text(encoding="utf-8").splitlines(), 1):
-        if line_number > CALIBRATION_MAX_SAMPLES:
-            raise ValueError("Calibration dataset contains too many samples")
-        values = line.split()
-        if len(values) != 2:
-            raise ValueError(
-                f"Calibration dataset line {line_number} must contain a feature/length pair"
-            )
-        paths = [(destination / value).resolve() for value in values]
-        if any(destination.resolve() not in path.parents for path in paths):
-            raise ValueError(f"Calibration dataset line {line_number} contains an unsafe path")
-        if not all(path.is_file() for path in paths):
-            raise ValueError(f"Calibration dataset line {line_number} references a missing input")
-        features = np.load(paths[0], allow_pickle=False, mmap_mode="r")
-        lengths = np.load(paths[1], allow_pickle=False, mmap_mode="r")
-        if features.dtype != np.float32 or tuple(features.shape) != FEATURE_SHAPE:
-            raise ValueError(f"Calibration features on line {line_number} have an invalid contract")
-        if lengths.dtype != np.int32 or tuple(lengths.shape) != LENGTH_SHAPE:
-            raise ValueError(f"Calibration lengths on line {line_number} have an invalid contract")
-        if not 1 <= int(lengths[0]) <= FEATURE_SHAPE[1]:
-            raise ValueError(f"Calibration length on line {line_number} is out of range")
-        if not np.isfinite(features).all():
-            raise ValueError(f"Calibration features on line {line_number} are not finite")
-        inferred_lengths = infer_lengths_from_landmarks(features)
-        if not np.array_equal(inferred_lengths, lengths):
-            raise ValueError(
-                f"Calibration length on line {line_number} does not match -100.0 padding"
-            )
-        referenced.update(Path(value) for value in values)
-        # The archive retains lengths for integrity checking, but the deployment
-        # graph derives its mask internally and RKNN calibration receives one input.
-        resolved_lines.append(str(paths[0]))
-    if not resolved_lines:
-        raise ValueError("Calibration dataset is empty")
-    actual_files = {
-        path.relative_to(destination) for path in destination.rglob("*") if path.is_file()
-    }
-    if actual_files != referenced:
-        raise ValueError(
-            "Calibration archive file set does not match dataset.txt: "
-            f"missing={sorted(map(str, referenced - actual_files))}, "
-            f"unexpected={sorted(map(str, actual_files - referenced))}"
-        )
-    resolved = destination / "dataset.resolved.txt"
-    resolved.write_text("\n".join(resolved_lines) + "\n", encoding="utf-8")
-    return resolved
-
-
 def _require_success(result: object, operation: str) -> None:
     if result not in (None, 0):
         raise RuntimeError(f"RKNN {operation} failed with code {result}")
@@ -366,7 +259,6 @@ def _validate_rknn_outputs(
     outputs: object,
     test_inputs: Sequence[np.ndarray],
     expected: np.ndarray,
-    quantized: bool,
 ) -> None:
     if len(test_inputs) != 1:
         raise RuntimeError(
@@ -389,14 +281,10 @@ def _validate_rknn_outputs(
     actual_valid = actual[:, :valid_steps].astype(np.float64, copy=False).reshape(-1)
     denominator = np.linalg.norm(expected_valid) * np.linalg.norm(actual_valid)
     cosine = float(np.dot(expected_valid, actual_valid) / denominator) if denominator else 0.0
-    if not quantized:
-        np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=5e-4)
-    elif cosine < 0.95:
-        raise RuntimeError(f"INT8 RKNN cosine similarity is {cosine:.6f}, expected >= 0.95")
+    np.testing.assert_allclose(actual, expected, rtol=1e-3, atol=5e-4)
     if valid_steps < OUTPUT_SHAPE[1]:
-        padding_tolerance = 5e-4 if quantized else 1e-6
         np.testing.assert_allclose(
-            actual[:, valid_steps:], 0.0, rtol=0.0, atol=padding_tolerance
+            actual[:, valid_steps:], 0.0, rtol=0.0, atol=1e-6
         )
     print(
         f"Validated {model_name} with RKNN simulator: "
@@ -404,11 +292,10 @@ def _validate_rknn_outputs(
     )
 
 
-def _build_one_rknn(
+def _build_rknn(
     onnx_path: Path,
     output_path: Path,
     target_platform: str,
-    dataset: Optional[Path],
     test_inputs: Sequence[np.ndarray],
     expected: np.ndarray,
 ) -> None:
@@ -416,73 +303,44 @@ def _build_one_rknn(
         raise RuntimeError("rknn-toolkit2 is required for RKNN conversion")
     converter = RKNN(verbose=False)
     try:
-        quantized = dataset is not None
-        config_args = {"target_platform": target_platform}
-        if quantized:
-            config_args["auto_hybrid_cos_thresh"] = RKNN_AUTO_HYBRID_COS_THRESHOLD
-        _require_success(converter.config(**config_args), "config")
+        _require_success(converter.config(target_platform=target_platform), "config")
         _require_success(converter.load_onnx(model=str(onnx_path)), "load_onnx")
-        build_args = {"do_quantization": quantized}
-        if quantized:
-            build_args["dataset"] = str(dataset)
-            build_args["auto_hybrid"] = True
-        _require_success(converter.build(**build_args), "build")
+        _require_success(converter.build(do_quantization=False), "build")
         _require_success(converter.export_rknn(str(output_path)), "export_rknn")
         _require_success(converter.init_runtime(), "init_runtime")
         outputs = converter.inference(inputs=list(test_inputs))
-        _validate_rknn_outputs(
-            output_path.name, outputs, test_inputs, expected, dataset is not None
-        )
+        _validate_rknn_outputs(output_path.name, outputs, test_inputs, expected)
     finally:
         converter.release()
 
 
-def build_rknn_models(
+def build_rknn_model(
     onnx_path: Path,
-    dataset: Path,
     rknn_path: Path,
-    int8_rknn_path: Path,
     target_platform: str,
     test_inputs: Sequence[np.ndarray],
     expected: np.ndarray,
 ) -> None:
-    _build_one_rknn(
-        onnx_path, rknn_path, target_platform, None, test_inputs, expected
-    )
-    _build_one_rknn(
-        onnx_path, int8_rknn_path, target_platform, dataset, test_inputs, expected
-    )
+    _build_rknn(onnx_path, rknn_path, target_platform, test_inputs, expected)
 
 
 def convert(
     pt_path: Path,
-    calibration_archive: Path,
     output_dir: Path,
     target_platform: str,
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     onnx_path = output_dir / "signlang_det_encoder.onnx"
     rknn_path = output_dir / "signlang_det_encoder.rknn"
-    int8_path = output_dir / "signlang_det_encoder.int8.rknn"
     landmarks, expected = export_onnx(pt_path, onnx_path)
-    with tempfile.TemporaryDirectory() as directory:
-        dataset = prepare_calibration_dataset(calibration_archive, Path(directory) / "calibration")
-        build_rknn_models(
-            onnx_path,
-            dataset,
-            rknn_path,
-            int8_path,
-            target_platform,
-            [landmarks],
-            expected,
-        )
-    return [onnx_path, rknn_path, int8_path]
+    build_rknn_model(
+        onnx_path, rknn_path, target_platform, [landmarks], expected
+    )
+    return [onnx_path, rknn_path]
 
 
-def validate_inputs(pt_path: Path, calibration_archive: Path) -> None:
+def validate_inputs(pt_path: Path) -> None:
     load_safe_checkpoint(pt_path)
-    with tempfile.TemporaryDirectory() as directory:
-        prepare_calibration_dataset(calibration_archive, Path(directory) / "calibration")
 
 
 def onnx_reference(onnx_path: Path) -> tuple[list[np.ndarray], np.ndarray]:
@@ -503,24 +361,20 @@ def verify_exported_rknn(output_dir: Path) -> None:
     if RKNN is None:
         raise RuntimeError("rknn-toolkit2 is required for RKNN verification")
     test_inputs, expected = onnx_reference(output_dir / "signlang_det_encoder.onnx")
-    for name, quantized in (
-        ("signlang_det_encoder.rknn", False),
-        ("signlang_det_encoder.int8.rknn", True),
-    ):
-        converter = RKNN(verbose=False)
-        try:
-            _require_success(converter.load_rknn(str(output_dir / name)), "load_rknn")
-            _require_success(converter.init_runtime(), "init_runtime")
-            outputs = converter.inference(inputs=test_inputs)
-            _validate_rknn_outputs(name, outputs, test_inputs, expected, quantized)
-        finally:
-            converter.release()
+    name = "signlang_det_encoder.rknn"
+    converter = RKNN(verbose=False)
+    try:
+        _require_success(converter.load_rknn(str(output_dir / name)), "load_rknn")
+        _require_success(converter.init_runtime(), "init_runtime")
+        outputs = converter.inference(inputs=test_inputs)
+        _validate_rknn_outputs(name, outputs, test_inputs, expected)
+    finally:
+        converter.release()
 
 
 def parser() -> argparse.ArgumentParser:
     command = argparse.ArgumentParser(description=__doc__)
     command.add_argument("--pt", type=Path, required=True)
-    command.add_argument("--calibration", type=Path, required=True)
     command.add_argument("--output-dir", type=Path, required=True)
     command.add_argument("--target-platform", default="rk3588")
     command.add_argument("--validate-only", action="store_true")
@@ -533,11 +387,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     if args.validate_only and args.verify_rknn_only:
         raise ValueError("Only one validation mode can be selected")
     if args.validate_only:
-        validate_inputs(args.pt, args.calibration)
+        validate_inputs(args.pt)
     elif args.verify_rknn_only:
         verify_exported_rknn(args.output_dir)
     else:
-        convert(args.pt, args.calibration, args.output_dir, args.target_platform)
+        convert(args.pt, args.output_dir, args.target_platform)
 
 
 if __name__ == "__main__":

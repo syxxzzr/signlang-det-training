@@ -54,7 +54,6 @@ GITHUB_UNTAGGED_RELEASE_PATTERN = re.compile(r"untagged-[0-9a-f]{20}", re.IGNORE
 STATUS_BOT_LOGIN = "github-actions[bot]"
 NOTEBOOK_OUTPUT_FILES = (
     "signlang_det_encoder.pt",
-    "int8_calibration.tar.gz",
     "figures/training_curves.png",
     "figures/retrieval_summary.png",
     "representation_training/metrics.csv",
@@ -66,7 +65,6 @@ RELEASE_MODEL_FILES = (
     "signlang_det_encoder.pt",
     "signlang_det_encoder.onnx",
     "signlang_det_encoder.rknn",
-    "signlang_det_encoder.int8.rknn",
 )
 RELEASE_ASSET_FILES = (
     *RELEASE_MODEL_FILES,
@@ -1195,12 +1193,6 @@ def create_model_manifest(
     missing = sorted(required - payload.keys())
     if missing:
         raise RuntimeError(f"PT export is missing model manifest fields: {missing}")
-    quantization = {
-        "signlang_det_encoder.pt": "none",
-        "signlang_det_encoder.onnx": "none",
-        "signlang_det_encoder.rknn": "none",
-        "signlang_det_encoder.int8.rknn": "int8",
-    }
     feature_contract = copy.deepcopy(payload["input_contract"])
     output_contract = copy.deepcopy(payload["output_contract"])
     fixed_landmarks = copy.deepcopy(feature_contract)
@@ -1218,17 +1210,10 @@ def create_model_manifest(
         "inputs": {"landmarks": fixed_landmarks},
         "outputs": {"frame_embeddings": fixed_output},
     }
-    int8_io = copy.deepcopy(fixed_io)
-    int8_io["inputs"]["landmarks"]["dtype"] = "int8"
-    int8_io["inputs"]["landmarks"]["quantization_parameters"] = (
-        "embedded; query scale and zero_point with RKNN Runtime"
-    )
-    int8_io["outputs"]["frame_embeddings"]["dtype"] = "float16"
     io_contracts = {
         "signlang_det_encoder.pt": pt_io,
         "signlang_det_encoder.onnx": fixed_io,
         "signlang_det_encoder.rknn": fixed_io,
-        "signlang_det_encoder.int8.rknn": int8_io,
     }
     models = {}
     for name in RELEASE_MODEL_FILES:
@@ -1237,7 +1222,6 @@ def create_model_manifest(
             raise RuntimeError(f"Cannot create model manifest; missing {name}")
         models[name] = {
             "format": path.suffix.removeprefix("."),
-            "quantization": quantization[name],
             "io_contract": io_contracts[name],
             "bytes": path.stat().st_size,
             "sha256": sha256_file(path),
@@ -1268,7 +1252,6 @@ def create_model_manifest(
             "pytorch_weights": "signlang_det_encoder.pt",
             "onnx_graph": "signlang_det_encoder.onnx",
             "rknn_graph": "signlang_det_encoder.rknn",
-            "rknn_int8_graph": "signlang_det_encoder.int8.rknn",
             "tokenizer": None,
         },
         "tokenizer": {
@@ -1334,7 +1317,6 @@ def create_release_assets(
         sys.executable,
         str(current_converter),
         "--pt", str(pt_asset),
-        "--calibration", str(output_root / "int8_calibration.tar.gz"),
         "--output-dir", str(asset_dir),
         "--target-platform", config.rknn_target_platform,
         "--validate-only",
@@ -1347,7 +1329,6 @@ def create_release_assets(
             sys.executable,
             str(converter),
             "--pt", str(pt_asset),
-            "--calibration", str(output_root / "int8_calibration.tar.gz"),
             "--output-dir", str(asset_dir),
             "--target-platform", config.rknn_target_platform,
         ])
@@ -1356,7 +1337,6 @@ def create_release_assets(
             sys.executable,
             str(current_converter),
             "--pt", str(pt_asset),
-            "--calibration", str(output_root / "int8_calibration.tar.gz"),
             "--output-dir", str(asset_dir),
             "--target-platform", config.rknn_target_platform,
             "--verify-rknn-only",
@@ -1578,8 +1558,8 @@ def publish_handoff_directory(handoff_dir: Path) -> str:
         f"- Kaggle version: `{state['kaggle_version']}`\n"
         f"- Kaggle URL: {state['kaggle_url']}\n"
         f"- RKNN target platform: `{metadata['rknn_target_platform']}`\n\n"
-        "PT, ONNX, non-quantized RKNN, INT8 RKNN, the model manifest, the tagged notebook, "
-        "and remaining notebook outputs are attached as seven Release assets.\n"
+        "PT, ONNX, RKNN, the model manifest, the tagged notebook, and remaining "
+        "notebook outputs are attached as six Release assets.\n"
     )
     published = github.publish(int(release["id"]), str(state["tag"]), body)
     if published.get("draft") or published.get("tag_name") != str(state["tag"]):
