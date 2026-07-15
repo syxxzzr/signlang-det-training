@@ -1,10 +1,12 @@
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).parents[1]
@@ -219,6 +221,64 @@ class IssueQueueTests(unittest.TestCase):
         self.assertIn("published=true", outputs)
         self.assertTrue(any(":failed -->" in comment["body"] for comment in comments))
         self.assertTrue(any(":succeeded -->" in comment["body"] for comment in comments))
+
+
+class ReleaseStateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.module = load_coordinator()
+
+    def release(self, state, tag_name):
+        return {
+            "id": 354162538,
+            "draft": True,
+            "tag_name": tag_name,
+            "body": json.dumps(state),
+        }
+
+    def test_synthetic_draft_tag_does_not_replace_queued_tag(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "queued",
+            "tag": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+        }
+
+        parsed = self.module.parse_release_state(
+            self.release(state, "untagged-b6af7d978bf098ad8043")
+        )
+
+        self.assertEqual(parsed["tag"], "v0.0.1-Alpha")
+        self.assertNotIn("tag_recovered_from", parsed)
+
+        config = SimpleNamespace(
+            kaggle_username="owner",
+            kernel_slug="kernel",
+            kernel_private=True,
+        )
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            mock.patch.object(self.module, "run", return_value="a" * 40 + "\n") as run,
+            mock.patch.object(self.module.subprocess, "check_output", return_value="{}"),
+        ):
+            self.module.stage_upload(parsed, config, Path(directory))
+
+        run.assert_called_once_with(
+            ["git", "rev-parse", "v0.0.1-Alpha^{commit}"]
+        )
+
+    def test_real_release_tag_still_repairs_stale_state(self):
+        state = {
+            "schema": self.module.STATE_SCHEMA,
+            "state": "queued",
+            "tag": "v0.0.1-Alpha",
+            "git_sha": "a" * 40,
+        }
+
+        parsed = self.module.parse_release_state(self.release(state, "v0.0.2"))
+
+        self.assertEqual(parsed["tag"], "v0.0.2")
+        self.assertEqual(parsed["tag_recovered_from"], "v0.0.1-Alpha")
 
 
 class UploadedZipTests(unittest.TestCase):

@@ -67,6 +67,8 @@ Watch the linked Kaggle page manually. A Kaggle error, timeout, or cancellation 
 
 If Kaggle submission itself fails, run **Kaggle CD - submit next tag** from the default branch with `retry_tag` set to the failed tag. It requeues only a Draft Release already marked `failed`. A running delivery is never polled by this workflow.
 
+GitHub may expose a Draft Release with a generated `untagged-<20 hex>` placeholder even though the queue body still records its registered Git tag. The coordinator ignores that placeholder and verifies the registered tag against the locked commit before uploading; other Release tag edits continue to repair stale queue metadata.
+
 If an uploaded ZIP fails validation or conversion, inspect the bot's failure comment and add a corrected attachment or `/convert` command. Do not edit an old candidate: new comments provide stable FIFO identity and trigger the workflow. The Issue closes only after Release publication succeeds.
 
 The conversion workflow may run for up to six hours while draining the candidates visible to it. Workflow concurrency prevents simultaneous drainers for the same Issue. Comments created during an active run trigger one later rescan, while the durable Issue history ensures candidates are not lost if GitHub replaces a pending concurrency run.

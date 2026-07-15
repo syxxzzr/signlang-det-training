@@ -50,6 +50,7 @@ CONVERT_COMMAND_PATTERN = re.compile(r"(?m)^[ \t]*/convert[ \t]+(.+?)[ \t]*$")
 ATTEMPT_STATUS_PATTERN = re.compile(
     rf"<!-- {re.escape(ATTEMPT_MARKER)}(?P<id>\d+:\d+):(?P<status>failed|succeeded) -->"
 )
+GITHUB_UNTAGGED_RELEASE_PATTERN = re.compile(r"untagged-[0-9a-f]{20}", re.IGNORECASE)
 NOTEBOOK_OUTPUT_FILES = (
     "signlang_det_encoder.pt",
     "int8_calibration.tar.gz",
@@ -127,6 +128,17 @@ def parse_release_state(release: Mapping[str, Any]) -> Optional[dict[str, Any]]:
         raise RuntimeError(f"CD release {release.get('id')} has no tag_name")
     if state.get("tag") != release_tag:
         previous_tag = state.get("tag")
+        if (
+            isinstance(previous_tag, str)
+            and previous_tag
+            and GITHUB_UNTAGGED_RELEASE_PATTERN.fullmatch(release_tag)
+        ):
+            print(
+                f"::warning::Ignoring synthetic tag {release_tag!r} for CD release "
+                f"{release.get('id')}; preserving queued tag {previous_tag!r}",
+                file=sys.stderr,
+            )
+            return state
         print(
             f"::warning::Repairing CD release {release.get('id')} tag mismatch: "
             f"state={previous_tag!r}, release={release_tag!r}",
