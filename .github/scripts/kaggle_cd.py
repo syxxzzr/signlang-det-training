@@ -202,7 +202,7 @@ def render_release_body(state: Mapping[str, Any]) -> str:
         "failed": "❌ Kaggle delivery stopped before completion.",
     }
     rows = [
-        f"| Status | **{html.escape(status.title())}** |",
+        f"| Status | {html.escape(status.title())} |",
         f"| Tag | `{html.escape(str(state.get('tag', '—')))}` |",
         f"| Commit | `{html.escape(str(state.get('git_sha', '—'))[:12])}` |",
         f"| Attempt | {int(state.get('attempt', 0))} |",
@@ -234,7 +234,7 @@ def render_release_body(state: Mapping[str, Any]) -> str:
         sections.extend([
             "", "### Failure", "",
             "> " + failure.replace("\n", "\n> "),
-            "", "Run **Kaggle CD - submit next tag** with `retry_tag` set to this tag after resolving the problem.",
+            "", "Run Kaggle CD - submit next tag with `retry_tag` set to this tag after resolving the problem.",
         ])
 
     encoded = base64.urlsafe_b64encode(
@@ -277,22 +277,22 @@ def render_delivery_issue(release: Mapping[str, Any], state: Mapping[str, Any]) 
         "## English",
         "",
         "This Issue is created and locked automatically. GitHub still allows repository users "
-        "with **Write** access to comment; other users cannot submit output.",
+        "with Write access to comment; other users cannot submit output.",
         "",
-        "### 1. Download the completed Kaggle output",
+        "### 1. Download the completed Kaggle output 📥",
         "",
         f"- Kaggle Notebook: {notebook_link_en}",
         f"- Draft Release: [open the delivery draft]({release_url})",
         "- Wait until Kaggle reports that the Notebook run is complete, then use its "
-        "**Output → Download all** action. Submit the downloaded output ZIP, not the Notebook source.",
+        "Output → Download all action. Submit the downloaded output ZIP, not the Notebook source.",
         "",
-        "### 2. Submit a conversion candidate",
+        "### 2. Submit a conversion candidate 📦",
         "",
         "Choose either method:",
         "",
-        "1. **Issue attachment:** create a new comment, attach one or more downloaded output ZIPs, "
+        "1. Issue attachment: create a new comment, attach one or more downloaded output ZIPs, "
         "and submit the comment. Each attachment is queued automatically; no command is required.",
-        "2. **Draft Release asset:** upload the file to the linked Draft Release, save the draft, "
+        "2. Draft Release asset: upload the file to the linked Draft Release, save the draft, "
         "then create a new Issue comment containing `/convert <exact asset name>`. The complete "
         "text after `/convert` is treated as the asset name, including spaces.",
         "",
@@ -300,11 +300,11 @@ def render_delivery_issue(release: Mapping[str, Any], state: Mapping[str, Any]) 
         "ZIP with the expected Kaggle output tree. Direct Issue attachments are subject to "
         "GitHub's attachment-size limit; use a Draft Release asset for larger files.",
         "",
-        "### Queue and status",
+        "### Queue and status 📋",
         "",
         "- Attachments and `/convert` commands are processed in comment order.",
         "- `⏳` means the candidate is being processed.",
-        "- `❌` means that candidate failed. Add a **new comment** to retry; do not edit an old comment.",
+        "- `❌` means that candidate failed. Add a new comment to retry; do not edit an old comment.",
         "- `✅` means conversion and validation succeeded. The workflow publishes the Release and "
         "closes this Issue automatically.",
         "- If every queued candidate fails, this Issue remains open and waits for another new comment.",
@@ -313,33 +313,33 @@ def render_delivery_issue(release: Mapping[str, Any], state: Mapping[str, Any]) 
         "",
         "## 中文说明",
         "",
-        "本 Issue 由系统自动创建并锁定。GitHub 仍允许拥有仓库 **Write** 权限的用户评论，"
+        "本 Issue 由系统自动创建并锁定。GitHub 仍允许拥有仓库 Write 权限的用户评论，"
         "其他用户不能提交输出。",
         "",
-        "### 1. 下载训练输出",
+        "### 1. 下载训练输出 📥",
         "",
         f"- Kaggle Notebook：{notebook_link_zh}",
         f"- Draft Release：[打开交付草稿]({release_url})",
-        "- 等待 Kaggle 显示 Notebook 运行完成，然后使用 **Output → Download all**。"
+        "- 等待 Kaggle 显示 Notebook 运行完成，然后使用 Output → Download all。"
         "请提交下载得到的输出 ZIP，不要提交 Notebook 源文件。",
         "",
-        "### 2. 提交转换候选包",
+        "### 2. 提交转换候选包 📦",
         "",
         "任选一种方式：",
         "",
-        "1. **Issue 附件：**新建一条评论，附加一个或多个输出 ZIP 后发送。每个附件会自动入队，"
+        "1. Issue 附件：新建一条评论，附加一个或多个输出 ZIP 后发送。每个附件会自动入队，"
         "不需要命令。",
-        "2. **Draft Release 资产：**先把文件上传到上方 Draft Release 并保存草稿，再新建评论："
+        "2. Draft Release 资产：先把文件上传到上方 Draft Release 并保存草稿，再新建评论："
         "`/convert <完整资产名>`。`/convert` 后的全部文字（包括空格）都作为资产名。",
         "",
         "文件名和扩展名不限，但内容必须是包含预期 Kaggle 输出目录的有效 ZIP。Issue 直接附件受 "
         "GitHub 大小限制；大文件请使用 Draft Release 资产。",
         "",
-        "### 队列与状态",
+        "### 队列与状态 📋",
         "",
         "- 附件和 `/convert` 命令按评论顺序依次处理。",
         "- `⏳`：正在处理。",
-        "- `❌`：该候选包失败。请发一条**新评论**重试，不要编辑旧评论。",
+        "- `❌`：该候选包失败。请发一条新评论重试，不要编辑旧评论。",
         "- `✅`：转换和验证成功，workflow 会发布 Release 并自动关闭本 Issue。",
         "- 如果当前候选包全部失败，Issue 会保持开启，等待下一条新评论。",
         "",
