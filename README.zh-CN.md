@@ -2,7 +2,7 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-一个适用于在 Kaggle 中训练通用动态手语特征编码器的开源项目，完整流程封装在可独立运行的 Notebook 中。
+一个适用于在 Kaggle 中训练通用动态手语特征编码器的开源项目，完整流程封装在可独立运行的 Notebook 中，训练结果可无缝适用于 [SignLang Eyes](https://github.com/hebust-2026-signlang-eyes/signlang-eyes)。
 
 ## 项目简介 🚀
 

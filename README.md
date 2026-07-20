@@ -2,7 +2,8 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md)
 
-Training workflow for a reusable dynamic sign language feature encoder, packaged as a self-contained notebook designed to run on Kaggle.
+Training workflow for a reusable dynamic sign language feature encoder, packaged as a self-contained notebook designed to run on Kaggle, 
+The training results can be seamlessly applied to [SignLang Eyes](https://github.com/hebust-2026-signlang-eyes/signlang-eyes).
 
 ## Overview 🚀
 
