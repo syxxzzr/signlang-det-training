@@ -131,6 +131,7 @@ Keep the encoder fingerprint and `hand168-temporal` preprocessing identifier wit
 
 - Thanks to [hoyso48](https://www.kaggle.com/hoyso48) for the valuable insights shared at [https://www.kaggle.com/competitions/asl-signs/writeups/hoyeol-sohn-1st-place-solution-1dcnn-combined-with](https://www.kaggle.com/competitions/asl-signs/writeups/hoyeol-sohn-1st-place-solution-1dcnn-combined-with).
 - Thanks to the organizers and contributors of the [Google - Isolated Sign Language Recognition](https://www.kaggle.com/competitions/asl-signs/data) competition for making the source corpus available through Kaggle.
+- Thanks to Microsoft for providing the [ASL Citizen](https://www.microsoft.com/en-us/research/project/asl-citizen/) dataset.
 - Thanks to [Abdelrhman Karam](https://www.kaggle.com/abdelrhmankaram) for publishing the [ASL-preprocessing 7 output](https://www.kaggle.com/code/abdelrhmankaram/asl-preprocessing-7/output) used for target-domain adaptation.
 
 The datasets remain subject to their original licenses, competition rules, and usage terms.
